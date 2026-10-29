@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111b2d">
+  <title>ArepaGo SOC · Observabilidad</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#resumen" aria-label="ArepaGo SOC inicio">
+        <span class="brand-mark">A</span><span>ArepaGo <small>SOC</small></span>
+      </a>
+      <div class="nav-caption">Operación</div>
+      <nav class="navigation" aria-label="Vistas del sistema">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">▦</span>Resumen</button>
+        <button class="nav-item" data-view="services"><span class="nav-icon">⌁</span>Servicios</button>
+        <button class="nav-item" data-view="incidents"><span class="nav-icon">◷</span>Incidentes<span id="nav-incident-count" class="nav-count">0</span></button>
+      </nav>
+      <div class="sidebar-bottom"><span class="live-indicator"></span><span><b id="sidebar-status">Conectando</b><small>API ArepaGo SOC</small></span></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="breadcrumb">Observabilidad <span>/</span> <b id="breadcrumb-title">Resumen</b></div>
+        <div class="top-actions"><span id="updated-at" class="updated-at">Esperando datos</span><button id="refresh-button" class="refresh-button" type="button"><span aria-hidden="true">↻</span> Actualizar</button></div>
+      </header>
+
+      <div id="global-error" class="error-banner" role="alert" hidden></div>
+
+      <section id="view-overview" class="view-section">
+        <div class="page-heading"><div><div class="eyebrow">CENTRO DE OPERACIONES</div><h1>Estado de ArepaGo</h1><p>Telemetría y alertas recientes de los microservicios.</p></div><div id="health-pill" class="health-pill pending"><span></span><b>Conectando</b></div></div>
+        <div class="metric-grid">
+          <article class="metric-card"><div class="metric-label">Mediciones recibidas <span class="metric-icon blue">⌁</span></div><div id="measurement-count" class="metric-value">—</div><div class="metric-foot">Historial almacenado en PostgreSQL</div></article>
+          <article class="metric-card"><div class="metric-label">Incidentes abiertos <span class="metric-icon red">!</span></div><div id="open-count" class="metric-value">—</div><div id="incident-foot" class="metric-foot">Sin incidentes activos</div></article>
+          <article class="metric-card"><div class="metric-label">Servicios con alertas <span class="metric-icon amber">△</span></div><div id="alert-service-count" class="metric-value">—</div><div class="metric-foot">De 4 servicios monitoreados</div></article>
+        </div>
+        <div class="content-grid">
+          <article class="panel chart-panel">
+            <div class="panel-heading"><div><h2>Latencia p95</h2><p>Mediciones recientes del servicio seleccionado</p></div><label class="select-wrap"><span class="sr-only">Servicio para graficar</span><select id="chart-service"><option value="pedidos">Pedidos</option><option value="pagos">Pagos</option><option value="calificaciones">Calificaciones</option><option value="catalogo">Catálogo</option></select></label></div>
+            <div id="chart-empty" class="chart-empty" hidden>No hay mediciones para este servicio todavía.</div>
+            <svg id="latency-chart" class="latency-chart" viewBox="0 0 760 250" role="img" aria-label="Gráfica de latencia p95 en milisegundos"></svg>
+            <div class="chart-legend"><span><i></i>Latencia p95 en milisegundos</span><span id="chart-peak">Pico: —</span></div>
+          </article>
+          <article class="panel incident-panel"><div class="panel-heading"><div><h2>Incidentes abiertos</h2><p>Alertas que requieren seguimiento</p></div><button class="text-button" data-go="incidents">Ver todos <span>→</span></button></div><div id="overview-incidents" class="incident-list"><div class="loading-row">Cargando incidentes…</div></div></article>
+        </div>
+        <article class="panel services-panel"><div class="panel-heading"><div><h2>Salud de servicios</h2><p>Última medición recibida por microservicio</p></div><button class="text-button" data-go="services">Ver servicios <span>→</span></button></div><div id="overview-services" class="service-grid"><div class="loading-row">Cargando servicios…</div></div></article>
+      </section>
+
+      <section id="view-services" class="view-section" hidden>
+        <div class="page-heading"><div><div class="eyebrow">TELEMETRÍA</div><h1>Servicios</h1><p>Estado y señales recientes por microservicio.</p></div></div>
+        <div id="services-detail" class="service-grid detail-grid"><div class="loading-row">Cargando servicios…</div></div>
+      </section>
+
+      <section id="view-incidents" class="view-section" hidden>
+        <div class="page-heading"><div><div class="eyebrow">GESTIÓN DE EVENTOS</div><h1>Incidentes</h1><p>Incidentes abiertos y su causa detectada.</p></div><label class="select-wrap"><span class="sr-only">Filtrar incidentes</span><select id="incident-filter"><option value="open">Abiertos</option><option value="all">Todos</option><option value="resolved">Resueltos</option></select></label></div>
+        <article class="panel incident-table-panel"><div class="table-scroll"><table><thead><tr><th>Servicio</th><th>Estado</th><th>Severidad</th><th>Detectado</th><th>Última señal</th><th>Causas</th></tr></thead><tbody id="incident-rows"><tr><td colspan="6" class="loading-row">Cargando incidentes…</td></tr></tbody></table></div></article>
+      </section>
+      <footer class="footer">ArepaGo SOC <span>·</span> Fuente: API de telemetría</footer>
+    </main>
+  </div>
+</body>
+</html>

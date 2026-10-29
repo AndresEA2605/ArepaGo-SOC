@@ -1,0 +1,20 @@
+services:
+  telemetry-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets:
+      - db_password
+      - rds_ca_bundle
+
+  incident-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets:
+      - db_password
+      - rds_ca_bundle
+
+secrets:
+  rds_ca_bundle:
+    file: ./secrets/global-bundle.pem

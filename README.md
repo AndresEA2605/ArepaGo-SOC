@@ -305,6 +305,111 @@ Para levantar a mano:
 APP_UID=$(id -u) APP_GID=$(id -g) docker compose --profile local up --build -d
 ```
 
+## Comprobación de redundancia (failover)
+
+Con dos réplicas el servicio debe seguir respondiendo aunque se apague una de ellas. Usa `sg docker -c` si tu usuario pertenece al grupo `docker` pero la sesión no lo tiene activo.
+
+### 1) Ver estado de las réplicas
+
+```sh
+sg docker -c 'docker ps --filter name=arepago-soc-catalogo-service --format "{{.Names}}\t{{.Status}}"'
+sg docker -c 'docker ps --filter name=arepago-soc-transaction-router --format "{{.Names}}\t{{.Status}}"'
+```
+
+### 2) Caída de una réplica de Catálogo
+
+El catálogo está detrás de `catalogo-alb` con dos réplicas. Al apagar una, `catalogo-alb` reintenta con la otra gracias a `proxy_next_upstream`.
+
+```sh
+# Línea base
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 'http://localhost:8081/api/catalogo/products?limit=1'
+done
+
+# Apagar una réplica
+sg docker -c 'docker stop arepago-soc-catalogo-service-2'
+sleep 3
+
+# Tráfico mientras está degradado
+for i in $(seq 1 30); do
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 'http://localhost:8081/api/catalogo/products?limit=1'
+done | sort | uniq -c
+
+# Restaurar
+sg docker -c 'docker start arepago-soc-catalogo-service-2'
+for i in $(seq 1 30); do
+  s=$(sg docker -c 'docker inspect --format "{{.State.Health.Status}}" arepago-soc-catalogo-service-2')
+  [ "$s" = "healthy" ] && echo "catalogo-service-2 healthy" && break
+  sleep 2
+done
+```
+
+Es normal ver 1 o 2 peticiones con mayor latencia (~2-3 s) mientras Nginx intenta la réplica caída antes de reintentar con la sana.
+
+### 3) Caída de una réplica del `transaction-router`
+
+El router está detrás de `edge-alb` con dos réplicas. Las rutas `/api/` tienen `proxy_connect_timeout` y `proxy_read_timeout`; la ruta `/health` comparte el upstream pero carece de esos timeouts explícitos, lo que puede hacer que el cliente se rinda antes si no se usa `--max-time`.
+
+```sh
+# Comprobar ambas réplicas sanas
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 3 http://localhost:8081/health
+
+# Apagar router-1
+sg docker -c 'docker stop arepago-soc-transaction-router-1'
+sleep 3
+
+# Probar con rutas reales (recomendado)
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 15 'http://localhost:8081/api/catalogo/products?limit=1'
+done | sort | uniq -c
+
+# Probar /health (puede mostrar comportamiento distinto si hay reintentos)
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 12 'http://localhost:8081/health'
+done | sort | uniq -c
+
+# Restaurar
+sg docker -c 'docker start arepago-soc-transaction-router-1'
+for i in $(seq 1 30); do
+  s=$(sg docker -c 'docker inspect --format "{{.State.Health.Status}}" arepago-soc-transaction-router-1')
+  [ "$s" = "healthy" ] && echo "transaction-router-1 healthy" && break
+  sleep 2
+done
+```
+
+### 4) Medir ventana de detección (más estricto)
+
+Para ver exactamente qué ocurre en el primer instante tras la caída:
+
+```sh
+# Asegurarse de que ambas estén sanas
+sg docker -c 'docker ps --filter name=arepago-soc-transaction-router --format "{{.Names}}\t{{.Status}}"'
+sleep 10
+
+# Apagar y disparar en el mismo momento
+sg docker -c 'docker stop arepago-soc-transaction-router-1' && \
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 15 'http://localhost:8081/api/catalogo/products?limit=1'
+done
+```
+
+En esta ventana es posible ver `504 Gateway Time-out` en **una única petición** (~3 s) mientras Nginx intenta conectar con la réplica caída, hace el reintento con `proxy_next_upstream` y, según el momento, devuelve `504`. Tras marcar el peer como fallido (`max_fails=3`, `fail_timeout=5s`), todo el tráfico va a la réplica sana y las respuestas vuelven a ser instantáneas.
+
+### 5) Comprobar logs de Nginx
+
+```sh
+sg docker -c 'docker logs --tail 15 arepago-soc-edge-alb-1'
+sg docker -c 'docker logs --tail 15 arepago-soc-catalogo-alb-1'
+```
+
+Busca entradas como `upstream timed out while connecting to upstream` para confirmar que hubo un intento a la réplica caída y el reintento hacia la réplica sana.
+
+### Notas sobre esta prueba
+
+- **El servicio sigue disponible:** la mayoría de las peticiones responden `200`. La caída solo afecta transitoriamente la primera petición en la ventana de detección.
+- **La causa:** `edge-alb` usa DNS dinámico (`resolver 127.0.0.11`) con `max_fails/fail_timeout`, pero no elimina la IP caída al instante. Cuando intenta conectarse, el `connect()` espera hasta `proxy_connect_timeout` antes de reintentar.
+- **Recomendación:** añadir `proxy_connect_timeout 3s; proxy_read_timeout 10s;` a la ubicación `location = /health` en `infra/nginx/edge.conf` para que el comportamiento sea consistente con `/api/`.
+
 ## API
 
 API: rutas HTTP disponibles (todas devuelven JSON salvo que se indique).

@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 from psycopg.types.json import Jsonb
 from services.common import JsonHandler, log_event
 from services.db import connection, init_pool, pool_stats
+from services.incident_rules import recovery_decision
 from services.internal_auth import IDENTITY_HEADER, load_secret, verify_identity
 from services.incident_simulator import (benchmark_rows, reference_scenario, run_local_benchmark,
                                          simulate_mitigations)
@@ -19,6 +20,10 @@ LATENCY_THRESHOLD_MS = float(os.environ.get("LATENCY_THRESHOLD_MS", "1000"))
 ERROR_RATE_THRESHOLD = float(os.environ.get("ERROR_RATE_THRESHOLD", "0.20"))
 POOL_WARNING_RATIO = float(os.environ.get("POOL_WARNING_RATIO", "0.75"))
 RECOVERY_SAMPLES_REQUIRED = max(2, min(10, int(os.environ.get("INCIDENT_RECOVERY_SAMPLES", "3"))))
+# Un incidente sin tráfico no puede validarse con muestras; tras esta ventana se
+# cierra por inactividad para no dejarlo abierto indefinidamente. 0 lo desactiva.
+INACTIVITY_MINUTES = max(0, min(1440, int(os.environ.get("INCIDENT_INACTIVITY_MINUTES", "30"))))
+INACTIVITY_SECONDS = INACTIVITY_MINUTES * 60
 SERVICES = {"pedidos", "pagos", "calificaciones", "catalogo"}
 SCHEMA = "soc_incidents"
 
@@ -99,12 +104,14 @@ def initialize():
             initial_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
             initial_measurement JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
-            recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED} CHECK (recovery_required >= 2)
+            recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED} CHECK (recovery_required >= 2),
+            resolution_reason TEXT NOT NULL DEFAULT ''
         )""")
         db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_reasons JSONB NOT NULL DEFAULT '[]'::jsonb")
         db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_measurement JSONB NOT NULL DEFAULT '{{}}'::jsonb")
         db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_count INTEGER NOT NULL DEFAULT 0")
         db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED}")
+        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS resolution_reason TEXT NOT NULL DEFAULT ''")
         # Preserve the best available opening evidence for incidents created before these columns existed.
         db.execute(f"""UPDATE {SCHEMA}.incidents SET
             initial_reasons = CASE WHEN initial_reasons = '[]'::jsonb THEN reasons ELSE initial_reasons END,
@@ -170,24 +177,28 @@ def evaluate(metric):
             row = db.execute(f"SELECT * FROM {SCHEMA}.incidents WHERE id=%s", (incident_id,)).fetchone()
             return {"action": "created", "incident": public(row)}
         if existing:
-            # A quiet window without requests cannot prove recovery. It resets the
-            # consecutive count, and only real traffic can validate the service.
-            if requests <= 0:
-                db.execute(f"""UPDATE {SCHEMA}.incidents SET latest_measurement=%s,recovery_count=0
+            seconds_since_breach = max(0.0, (timestamp - existing["last_seen"]).total_seconds())
+            action, recovery_count, resolution_reason = recovery_decision(
+                requests, int(existing.get("recovery_count", 0)),
+                int(existing.get("recovery_required", RECOVERY_SAMPLES_REQUIRED)),
+                seconds_since_breach, INACTIVITY_SECONDS)
+            if action == "awaiting_traffic":
+                # A quiet window proves nothing either way: keep the accumulated
+                # evidence instead of resetting it, so intermittent traffic can
+                # still confirm recovery.
+                db.execute(f"""UPDATE {SCHEMA}.incidents SET latest_measurement=%s
                     WHERE id=%s""", (Jsonb(metric), existing["id"]))
-                row = db.execute(f"SELECT * FROM {SCHEMA}.incidents WHERE id=%s", (existing["id"],)).fetchone()
-                return {"action": "awaiting_traffic", "incident": public(row)}
-            recovery_count = int(existing.get("recovery_count", 0)) + 1
-            if recovery_count < int(existing.get("recovery_required", RECOVERY_SAMPLES_REQUIRED)):
+            elif action == "recovering":
                 db.execute(f"""UPDATE {SCHEMA}.incidents SET latest_measurement=%s,recovery_count=%s
                     WHERE id=%s""", (Jsonb(metric), recovery_count, existing["id"]))
-                row = db.execute(f"SELECT * FROM {SCHEMA}.incidents WHERE id=%s", (existing["id"],)).fetchone()
-                return {"action": "recovering", "incident": public(row)}
-            db.execute(f"""UPDATE {SCHEMA}.incidents SET status='resolved',resolved_at=%s,last_seen=%s,
-                latest_measurement=%s,recovery_count=%s WHERE id=%s""",
-                (timestamp, timestamp, Jsonb(metric), recovery_count, existing["id"]))
+            else:
+                db.execute(f"""UPDATE {SCHEMA}.incidents SET status='resolved',resolved_at=%s,last_seen=%s,
+                    latest_measurement=%s,recovery_count=%s,resolution_reason=%s WHERE id=%s""",
+                    (timestamp, timestamp, Jsonb(metric), recovery_count, resolution_reason, existing["id"]))
+                log_event("incident_resolved", level="info", service=service, incident_id=str(existing["id"]),
+                          reason=resolution_reason, recovery_count=recovery_count)
             row = db.execute(f"SELECT * FROM {SCHEMA}.incidents WHERE id=%s", (existing["id"],)).fetchone()
-            return {"action": "resolved", "incident": public(row)}
+            return {"action": action, "incident": public(row)}
     return {"action": "no_change", "incident": None}
 
 class Handler(JsonHandler):

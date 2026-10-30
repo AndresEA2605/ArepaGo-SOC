@@ -313,6 +313,7 @@ services:
       ERROR_RATE_THRESHOLD: "0.20"
       POOL_WARNING_RATIO: "0.75"
       INCIDENT_RECOVERY_SAMPLES: ${INCIDENT_RECOVERY_SAMPLES:-3}
+      INCIDENT_INACTIVITY_MINUTES: ${INCIDENT_INACTIVITY_MINUTES:-30}
       INTERNAL_AUTH_SECRET_FILE: /run/secrets/internal_auth_secret
     secrets:
       - db_password

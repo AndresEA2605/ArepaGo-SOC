@@ -186,14 +186,14 @@ function renderIncidentDetail(incident,data) {
   const latest=incident.latest_measurement||{};
   const opening=incident.initial_measurement||incident.latest_measurement||{};
   const recoveryRequired=incident.recovery_required||3;
-  const recoveryStatus=incident.status==='resolved'?`${incident.recovery_count||recoveryRequired}/${recoveryRequired} muestras sanas consecutivas`:`Validando ${incident.recovery_count||0}/${recoveryRequired} muestras sanas`;
+  const recoveryStatus=incident.status==='resolved'?(incident.resolution_reason==='inactivity_timeout'?'Cerrado por inactividad (sin tráfico)':`${incident.recovery_count||recoveryRequired}/${recoveryRequired} muestras sanas consecutivas`):`Validando ${incident.recovery_count||0}/${recoveryRequired} muestras sanas`;
   const pool=latest.db_pool_active==null?'Sin medición':`${latest.db_pool_active}/${latest.db_pool_max}`;
   const errRate=latest.request_count?`${(latest.error_count/latest.request_count*100).toLocaleString('es-CO',{maximumFractionDigits:1})}%`:'Sin tráfico';
   [['Detectado',prettyTime(incident.started_at)],['Última señal',prettyTime(incident.last_seen)],['Resuelto',prettyTime(incident.resolved_at)],['Recuperación',recoveryStatus],['Última tasa observada',errRate],['Solicitudes / errores',`${latest.request_count??'—'} / ${latest.error_count??'—'}`],['Pool observado',pool]].forEach(([label,value])=>{const item=node('div','simulator-stat');item.append(node('span','',label),node('b','',value));overview.append(item);});
   target.append(overview);
   const causes=node('section','incident-detail-section');causes.append(node('h3','','Causas detectadas al abrir (evidencia conservada)'));
   const openingReasons=incident.initial_reasons||incident.reasons||[];
-  causes.append(node('p','simulator-assumptions',`Cierre automático: ${recoveryRequired} mediciones consecutivas con tráfico, dentro de los umbrales. Cualquier medición degradada reinicia el conteo; una muestra sin solicitudes no confirma recuperación.`));
+  causes.append(node('p','simulator-assumptions',`Cierre automático: ${recoveryRequired} mediciones consecutivas con tráfico, dentro de los umbrales. Cualquier medición degradada reinicia el conteo; una muestra sin solicitudes no confirma recuperación ni reinicia el conteo. Si no hay tráfico durante la ventana de inactividad configurada, el incidente se cierra por inactividad.`));
   const causeList=node('div','cause-list');openingReasons.forEach(reason=>causeList.append(node('span','cause-chip',`${reasonName(reason)} · umbral ${reason.signal==='latency_p95_ms'?latency(reason.threshold):percent(reason.threshold)}`)));
   if(!openingReasons.length)causeList.append(node('p','empty-state','El registro no conserva señales de causa.'));
   causes.append(node('p','simulator-assumptions',`Medición original: ${prettyTime(opening.timestamp)} · ${opening.request_count??'—'} solicitudes · ${opening.error_count??'—'} errores · latencia p95 ${latency(opening.latency_p95_ms)}.`));

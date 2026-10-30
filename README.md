@@ -1,4 +1,4 @@
-# ArepaGo SOC · microservicios con PostgreSQL
+# ArepaGo SOC · APP Con PostgreSQL y Dashboard 
 
 Aplicación de observabilidad para ArepaGo con cliente visual y backend de microservicios. El cliente muestra resumen, servicios e incidentes, y consume los endpoints agregados de Views Service. La ingesta y el ciclo de incidentes persisten en PostgreSQL; cada servicio conserva su esquema lógico propio dentro de la base.
 

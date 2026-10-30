@@ -6,7 +6,7 @@ Aplicación de pedidos de arepas con panel de observabilidad (SOC, *Security Ope
 - **Stack:** 22 contenedores (procesos aislados que ejecutan una imagen: plantilla con el código y sus dependencias), 2 réplicas (instancias del mismo servicio) de cada servicio de negocio y del enrutador
 - **Pruebas:** `python3 -m unittest discover -s tests -v` (60 pruebas)
 
-**Secciones:** [Arquitectura](#arquitectura) · [Datos](#modelo-de-datos) · [Seguridad](#seguridad-y-sesiones) · [Observabilidad](#observabilidad-y-detección-de-incidentes) · [Local](#ejecución-local) · [API](#api)
+**Secciones:** [Arquitectura](#arquitectura) · [Flujos](#flujos-de-extremo-a-extremo) · [Datos](#modelo-de-datos) · [Reglas](#reglas-de-negocio) · [Seguridad](#seguridad-y-sesiones) · [Observabilidad](#observabilidad-y-detección-de-incidentes) · [Local](#ejecución-local) · [API](#api)
 
 ## Arquitectura
 
@@ -25,7 +25,7 @@ edge-alb (Nginx :8081)  ── cabeceras de seguridad, IP real, protocolo origin
         ├── /api/auth/*          → auth-service (:8004)          → PostgreSQL
         ├── /api/telemetry*      → telemetry-service (:8001)     → PostgreSQL
         ├── /api/incidents*      → incident-service (:8002)      → PostgreSQL
-        ├── /api/views/*         → views-service (:8003)         → Telemetry + Incidents
+        ├── /api/views/*         → views-service (:8003)         → telemetry-service + incident-service
         ├── /api/reports*        → reports-service (:8005)       → PostgreSQL
         ├── /api/pedidos/*       → pedidos-alb (Nginx) → pedidos-service ×2 (:8000)
         ├── /api/pagos/*         → pagos-alb → pagos-service ×2
@@ -33,7 +33,7 @@ edge-alb (Nginx :8081)  ── cabeceras de seguridad, IP real, protocolo origin
         └── /api/catalogo/*      → catalogo-alb → catalogo-service ×2
 ```
 
-Cada `*-alb` es un Nginx que reparte el tráfico entre las dos réplicas de su servicio, con resolución DNS (*Domain Name System*: traducción de nombres a IPs) dinámica y reintentos (`proxy_next_upstream`, `max_fails`, `fail_timeout`). El sufijo `-alb` identifica estos balanceadores locales.
+El sufijo `-alb` identifica los balanceadores locales (Nginx) que reparten cada familia de negocio entre sus dos réplicas. El mecanismo está en [Réplicas y balanceo](#réplicas-y-balanceo).
 
 ### Componentes
 
@@ -45,6 +45,7 @@ Cada `*-alb` es un Nginx que reparte el tráfico entre las dos réplicas de su s
 **Enrutado**
 
 - `transaction-router` (enrutador central) ×2 — sesión, CSRF (*Cross-Site Request Forgery*: peticiones falsificadas desde otro sitio), identidad interna, métricas y reparto.
+- `pedidos-alb`, `pagos-alb`, `calificaciones-alb` y `catalogo-alb` ×1 — Nginx que reparten cada dominio entre sus dos réplicas (puerto 80).
 
 **Negocio**
 
@@ -62,18 +63,73 @@ Cada `*-alb` es un Nginx que reparte el tráfico entre las dos réplicas de su s
 
 - `postgres` (5432) — PostgreSQL 18.6, volumen `postgres-data`.
 
-Los cuatro `*-alb` (Nginx, puerto 80) son los balanceadores locales de cada familia de negocio.
+### Réplicas y balanceo
 
-### Flujo de una petición
+Dos réplicas significan el mismo código en dos contenedores con IP distinta. Sirven para repartir carga, tolerar la caída de una instancia y escalar un servicio sin tocar los demás.
+
+Funciona porque los servicios no guardan estado en memoria: la sesión y los pedidos viven en PostgreSQL, así que cualquier réplica puede atender cualquier petición.
+
+- **Con 2 réplicas:** `transaction-router`, `pedidos-service`, `pagos-service`, `calificaciones-service` y `catalogo-service` (el tráfico de usuario).
+- **Con 1 réplica:** `auth-service` (rate limiting en memoria), `telemetry-service`, `incident-service` (evaluador periódico), `views-service` y `reports-service`.
+- **Con 1 instancia:** `edge-alb`, `frontend-service`, los cuatro `*-alb` y `postgres`.
+
+El conteo de 22 contenedores:
+
+```text
+1 edge-alb + 1 frontend + 2 router + 4 *-alb
++ 8 réplicas de negocio (4 servicios × 2)
++ 5 servicios de apoyo + 1 postgres = 22
+```
+
+**Cómo reparte un `*-alb`:** cada archivo `infra/nginx/*.conf` declara un `upstream` (grupo de servidores destino) con el nombre del servicio y `resolve`; Nginx pregunta al DNS (*Domain Name System*: traducción de nombres a IPs) interno de Docker (`127.0.0.11`), recibe las dos IPs y las rota en round-robin (una petición a cada réplica por turno). `max_fails=3` y `fail_timeout=5s` sacan de rotación una réplica que falla; `proxy_next_upstream` reintenta la petición en la otra si hay error, timeout o `502/503/504`.
+
+El router no conoce las réplicas: solo llama a `http://pedidos-alb`, y el balanceador decide. Así se cambia el número de réplicas sin tocar el router.
+
+**Límite local:** `edge-alb` y cada `*-alb` son una sola instancia. Si cae `edge-alb` no hay entrada; si cae un `*-alb`, ese dominio deja de responder aunque sus réplicas estén sanas. Es el punto único de fallo del entorno local.
+
+## Flujos de extremo a extremo
+
+Los tres recorridos comparten el mismo camino; cambian el destino y la lógica.
+
+### Camino común
 
 1. El navegador llama `http://localhost:8081/api/...`; `edge-alb` recibe la petición y conserva el protocolo y la IP originales en `X-Forwarded-Proto` y `X-Forwarded-For`.
-2. `edge-alb` resuelve la IP real del cliente (rangos privados del balanceador), añade CSP (*Content Security Policy*: limita el origen de scripts y estilos) y `X-Frame-Options`, y enruta al `transaction-router`.
+2. `edge-alb` resuelve la IP real del cliente (rangos privados del balanceador), añade CSP (*Content Security Policy*: limita el origen de scripts y estilos) y `X-Frame-Options`, y reparte entre las dos réplicas del `transaction-router`.
 3. El router valida sesión (cookie `ag_session`) y CSRF (exige `Origin` —sitio de origen— y protocolo del mismo sitio), y autoriza por rol y recurso.
 4. El router firma la identidad (`X-ArepaGo-Identity`) con HMAC-SHA256 (*Hash-based Message Authentication Code* con SHA-256: firma con clave secreta) y la reenvía al servicio destino.
 5. El servicio verifica firma y expiración (120 s) antes de confiar en el `user_id`/rol, ejecuta la lógica y responde JSON (*JavaScript Object Notation*: formato de texto estructurado).
 6. El router registra la observación (servicio, ruta normalizada, estado, latencia) para el muestreo de telemetría.
 
-La identidad interna **no** viaja como cabeceras de confianza: un cliente no puede falsificarla sin el secreto. `INTERNAL_AUTH_SECRET_FILE` se monta en router, servicios de negocio, incidents y reports; auth/telemetry/views no lo necesitan.
+La identidad interna **no** viaja como cabecera de confianza: un cliente no puede falsificarla sin el secreto. `INTERNAL_AUTH_SECRET_FILE` se monta en router, servicios de negocio, incidents y reports; auth/telemetry/views no lo necesitan.
+
+### Login
+
+1. `POST /api/auth/login` con `{email, password}` → `edge-alb` → router.
+2. El router aplica la comprobación CSRF del camino común y reenvía a `auth-service` (1 réplica).
+3. `auth-service` verifica la contraseña con `scrypt` (parámetros en Modelo de datos) y crea la sesión: token aleatorio, su SHA-256 y una expiración.
+4. El router recibe el token y responde al navegador con `Set-Cookie: ag_session` (cabecera que instala la cookie; atributos en Seguridad y sesiones).
+5. En las siguientes peticiones el router lee la cookie, pregunta a `auth-service` por la sesión y, si es válida, firma la identidad del usuario.
+
+### Pedido
+
+1. `POST /api/pedidos/orders` con `items`, `delivery_address` e `Idempotency-Key`.
+2. `edge-alb` → router: valida sesión, CSRF y rol (cliente o admin).
+3. El router firma la identidad y llama a `pedidos-alb`.
+4. `pedidos-alb` reparte entre las dos réplicas de `pedidos-service`.
+5. La réplica valida el pedido contra `catalogo-alb` y guarda pedido y líneas en `soc_orders` dentro de una transacción (todo o nada).
+6. Crea el pago `pending` a través de `pagos-alb`; si falla, cancela el pedido.
+7. Responde JSON con pedido y pago. Un reintento con la misma `Idempotency-Key` no duplica el pedido (ver Modelo de datos).
+
+### Panel SOC
+
+1. El panel pide `/api/views/overview`, `/api/telemetry` o `/api/incidents`.
+2. `edge-alb` → router: estas rutas exigen rol `admin`.
+3. El router consulta `views-service` (estado por servicio), `telemetry-service` (mediciones y logs) o `incident-service` (incidentes).
+4. De forma independiente, el router publica sus mediciones y `telemetry-service` las guarda en `soc_telemetry.measurements`.
+5. `incident-service` evalúa umbrales y abre, actualiza o cierra incidentes.
+6. `views-service` compone las vistas con datos de `telemetry-service` e `incident-service`.
+
+El detalle de muestreo, umbrales y p95 está en [Observabilidad](#observabilidad-y-detección-de-incidentes).
 
 ## Modelo de datos
 
@@ -112,7 +168,9 @@ Cada servicio aplica sus migraciones versionadas (cambios de esquema reproducibl
 - **Contenedores:** imagen non-root (sin privilegios) con UID/GID (identificadores de usuario/grupo en Linux) configurables, `cap_drop: ALL` (sin capacidades), `no-new-privileges` (no escalar privilegios) y `server_tokens off` (oculta la versión de Nginx).
 - **Secretos:** `db_password`, `admin_password` e `internal_auth_secret` se montan como archivos (`*_FILE`) y están en `.gitignore`.
 
-## Flujo de negocio
+## Reglas de negocio
+
+Reglas del dominio; el recorrido técnico está en [Flujos de extremo a extremo](#flujos-de-extremo-a-extremo).
 
 1. **Catálogo:** lectura pública paginada (solo productos publicados); altas, cambios, publicación y retiro requieren admin. Retirar es una baja lógica: el producto se oculta al público pero el admin puede volver a publicarlo.
 2. **Pedido:** autenticado, con `items`, `delivery_address` y `payment_method: cash_on_delivery`. Estados: `placed → confirmed → preparing → out_for_delivery → delivered`, con cancelación antes del despacho.
@@ -131,9 +189,9 @@ El `transaction-router` mide cada petición que reenvía a un servicio de negoci
 - hasta 20 rutas con errores (método, ruta normalizada, conteos y estados),
 - pool de la base (`active`/`max`) consultado por cada router a una réplica del servicio; el agregado conserva la peor ocupación.
 
-Cada réplica del router publica su propia medición con `replica` (nombre del contenedor): en un intervalo hay dos filas por servicio y cada una cubre el tráfico que atendió esa réplica. Telemetry agrega la **última muestra de cada réplica**: suma `request_count`/`error_count`, toma el peor p95 y la peor ocupación de pool, y fusiona los diagnósticos. Una réplica que deja de publicar sale del agregado tras `MEASUREMENT_FRESH_SECONDS` (120 s), para no inflar el tráfico con datos viejos.
+Cada réplica del router publica su propia medición con `replica` (nombre del contenedor): en un intervalo hay dos filas por servicio y cada una cubre el tráfico que atendió esa réplica. `telemetry-service` agrega la **última muestra de cada réplica**: suma `request_count`/`error_count`, toma el peor p95 y la peor ocupación de pool, y fusiona los diagnósticos. Una réplica que deja de publicar sale del agregado tras `MEASUREMENT_FRESH_SECONDS` (120 s), para no inflar el tráfico con datos viejos.
 
-Las mediciones se guardan en `soc_telemetry.measurements`. El servicio Incident consulta el agregado cada `INCIDENT_EVALUATE_SECONDS` (15 s) y aplica los umbrales **una vez por servicio**, no por réplica. `POST /evaluate` sigue disponible para evaluación manual o pruebas.
+Las mediciones se guardan en `soc_telemetry.measurements`. `incident-service` consulta el agregado cada `INCIDENT_EVALUATE_SECONDS` (15 s) y aplica los umbrales **una vez por servicio**, no por réplica. `POST /evaluate` sigue disponible para evaluación manual o pruebas.
 
 ### Umbrales
 
@@ -186,7 +244,7 @@ Una muestra degradada reinicia el conteo; por eso se requieren muestras **consec
 
 ### Logs
 
-Cada servicio escribe JSON a stdout y envía de forma asíncrona a Telemetry los eventos de nivel `warning`, `error` y `critical` (cola de 1.000, sin bloquear la petición). `GET /api/telemetry/logs` (admin) filtra por servicio y rango, hasta 31 días y 200 filas. Docker (plataforma de contenedores) rota `10 MB × 3` por contenedor.
+Cada servicio escribe JSON a stdout y envía de forma asíncrona a `telemetry-service` los eventos de nivel `warning`, `error` y `critical` (cola de 1.000, sin bloquear la petición). `GET /api/telemetry/logs` (admin) filtra por servicio y rango, hasta 31 días y 200 filas. Docker (plataforma de contenedores) rota `10 MB × 3` por contenedor.
 
 ### Verificaciones periódicas
 
@@ -308,6 +366,6 @@ Scripts auxiliares (**solo local**):
 
 ## Pool y capacidad
 
-`DB_POOL_MIN_SIZE`/`DB_POOL_MAX_SIZE` configuran el pool de cada proceso (máximo 10). Compose ejecuta 12 procesos con pool (8 réplicas de negocio + Telemetry, Incidents, Auth y Reports): 120 conexiones máximas frente a las 250 de PostgreSQL local.
+`DB_POOL_MIN_SIZE`/`DB_POOL_MAX_SIZE` configuran el pool de cada proceso (máximo 10). Compose ejecuta 12 procesos con pool (8 réplicas de negocio + `telemetry-service`, `incident-service`, `auth-service` y `reports-service`): 120 conexiones máximas frente a las 250 de PostgreSQL local.
 
 Las consultas que superan `SLOW_QUERY_MS` (500 ms) generan un log JSON con módulo, operación, duración y huella SHA-256; no se registran valores ni parámetros SQL.

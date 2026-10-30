@@ -293,9 +293,15 @@ class Handler(JsonHandler):
                 offset = max(0, int(params.get("offset", ["0"])[0]))
             except ValueError as exc:
                 raise ValueError("limit y offset deben ser enteros válidos") from exc
+            # El catálogo público solo ve productos publicados. El admin puede
+            # pedir los retirados para poder volver a publicarlos.
+            include_inactive = params.get("include_inactive", ["false"])[0].lower() in {"1", "true", "yes"}
+            if include_inactive and self.require_user(("admin",)) is None:
+                return
+            clause = "" if include_inactive else "WHERE active=TRUE"
             with connection() as db:
-                rows = db.execute(f"SELECT * FROM {schema}.products WHERE active=TRUE ORDER BY name LIMIT %s OFFSET %s", (limit, offset)).fetchall()
-                total = db.execute(f"SELECT COUNT(*) AS count FROM {schema}.products WHERE active=TRUE").fetchone()["count"]
+                rows = db.execute(f"SELECT * FROM {schema}.products {clause} ORDER BY name LIMIT %s OFFSET %s", (limit, offset)).fetchall()
+                total = db.execute(f"SELECT COUNT(*) AS count FROM {schema}.products {clause}").fetchone()["count"]
             self.send_json(200, {"products": [product_dict(row) for row in rows], "total": total, "limit": limit, "offset": offset})
             return
         parts = path.split("/")
@@ -363,12 +369,18 @@ class Handler(JsonHandler):
                 if parsed_image.scheme not in {"https", "http"} or not parsed_image.netloc:
                     raise ValueError("image_url debe ser una URL http o https")
             fields["image_url"] = image_url
+        if "active" in data:
+            active = data["active"]
+            if not isinstance(active, bool):
+                raise ValueError("active debe ser true o false")
+            fields["active"] = active
         if not fields:
             raise ValueError("envía al menos un campo modificable")
         assignments = ",".join(f"{key}=%s" for key in fields)
         schema = SCHEMAS["catalogo"]
         with connection() as db:
-            row = db.execute(f"UPDATE {schema}.products SET {assignments},updated_at=now() WHERE id=%s AND active=TRUE RETURNING *",
+            # Se permite editar productos retirados para poder republicarlos.
+            row = db.execute(f"UPDATE {schema}.products SET {assignments},updated_at=now() WHERE id=%s RETURNING *",
                               (*fields.values(), product_id)).fetchone()
         self.send_json(404, {"error": "producto no encontrado"}) if row is None else self.send_json(200, {"product": product_dict(row)})
 

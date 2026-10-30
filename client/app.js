@@ -537,11 +537,18 @@ byId('admin-payments').addEventListener('click', async event => {
 });
 byId('admin-products').addEventListener('click', async event => {
   const edit = event.target.closest('[data-edit-product]');
-  const remove = event.target.closest('[data-delete-product]');
+  const toggle = event.target.closest('[data-toggle-product]');
   if (edit) { const product = adminProducts.get(edit.dataset.editProduct); if (product) fillProductForm(product); }
-  if (remove && window.confirm('¿Retirar este producto del catálogo?')) {
-    try { await api(`/api/catalogo/products/${encodeURIComponent(remove.dataset.deleteProduct)}`, {method:'DELETE'}); await loadAdminView('catalog'); }
-    catch (error) { showAdminError(error.message); }
+  if (toggle) {
+    const product = adminProducts.get(toggle.dataset.toggleProduct);
+    if (!product) return;
+    const publish = !product.active;
+    if (!window.confirm(publish ? '¿Publicar este producto en el catálogo?' : '¿Retirar este producto del catálogo?')) return;
+    toggle.disabled = true;
+    try {
+      await api(`/api/catalogo/products/${encodeURIComponent(product.id)}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active: publish})});
+      await loadAdminView('catalog');
+    } catch (error) { showAdminError(error.message); toggle.disabled = false; }
   }
 });
 byId('admin-product-form').addEventListener('submit', async event => {
@@ -849,16 +856,17 @@ function resetProductForm() {
 function renderAdminProducts(products) {
   adminProducts = new Map(products.map(product => [product.id, product]));
   const target = byId('admin-products'); target.replaceChildren();
-  if (!products.length) { target.append(node('div', 'empty-state', 'No hay productos activos. Crea el primero usando el formulario.')); return; }
+  if (!products.length) { target.append(node('div', 'empty-state', 'No hay productos. Crea el primero usando el formulario.')); return; }
   products.forEach(product => {
-    const card = node('article', 'product-card');
-    card.append(node('div', 'product-placeholder', 'Producto activo'));
+    const card = node('article', `product-card${product.active ? '' : ' product-inactive'}`);
+    card.append(node('div', 'product-placeholder', product.active ? 'Publicado' : 'Retirado'));
     const body = node('div', 'product-body');
     body.append(node('h3', '', product.name), node('div', 'product-description', product.description || 'Sin descripción'), node('b', 'product-price', money(product.price)));
     const actions = node('div', 'order-actions');
     const edit = node('button', 'small-action', 'Editar'); edit.type = 'button'; edit.dataset.editProduct = product.id;
-    const del = node('button', 'small-action danger-action', 'Retirar'); del.type = 'button'; del.dataset.deleteProduct = product.id;
-    actions.append(edit, del); body.append(actions); card.append(body); target.append(card);
+    const toggle = node('button', `small-action${product.active ? ' danger-action' : ''}`, product.active ? 'Retirar' : 'Publicar');
+    toggle.type = 'button'; toggle.dataset.toggleProduct = product.id;
+    actions.append(edit, toggle); body.append(actions); card.append(body); target.append(card);
   });
 }
 function renderAdminOrders(orders) {
@@ -1115,7 +1123,7 @@ async function loadAdminView(view) {
       const [payments, orders] = await Promise.all([api('/api/pagos/payments'),api('/api/pedidos/orders')]);
       renderAdminPayments(payments.payments || [],orders.orders || []);
     }
-    if (view === 'catalog') renderAdminProducts((await api('/api/catalogo/products?limit=100')).products || []);
+    if (view === 'catalog') renderAdminProducts((await api('/api/catalogo/products?limit=100&include_inactive=true')).products || []);
     if (view === 'ratings') renderAdminRatings((await api('/api/calificaciones/ratings')).ratings || []);
     if (view === 'reports') {
       const query=new URLSearchParams({status:byId('report-status-filter').value,category:byId('report-category-filter').value});

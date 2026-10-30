@@ -84,7 +84,7 @@ Un esquema por módulo, con un pool de conexiones por proceso:
 - **Logs:** mensajes truncados a 4.000 caracteres y trazas a 16.000; rutas normalizadas (`/orders/{id}`) para no almacenar identificadores ni query strings. Los parámetros SQL no se registran.
 - **Retención:** los logs se purgan a los `LOG_RETENTION_DAYS` días (30 por defecto, comprobación cada hora). Las mediciones, incidentes, pedidos y reportes **no** se purgan automáticamente.
 - **Backups:** en local el volumen `postgres-data` conserva todo; para un respaldo lógico usa `pg_dump`. En RDS se usan backups automáticos con point-in-time recovery.
-- **Catálogo inicial:** vacío. Los productos `DEMO · …` quedan inactivos y no se cargan solos; el menú real se publica desde el panel admin.
+- **Catálogo inicial:** vacío. Los productos `DEMO · …` quedan inactivos y no se cargan solos; el menú real se publica desde el panel admin. Un producto retirado sigue visible para el admin (marcado como retirado) y puede republicarse sin recrearlo.
 
 ## Seguridad y sesiones
 
@@ -98,7 +98,7 @@ Un esquema por módulo, con un pool de conexiones por proceso:
 
 ## Flujo de negocio
 
-1. **Catálogo:** lectura pública paginada; altas/cambios/bajas lógicas requieren admin.
+1. **Catálogo:** lectura pública paginada (solo productos publicados); altas, cambios, publicación y retiro requieren admin. Retirar es una baja lógica: el producto se oculta al público pero el admin puede volver a publicarlo.
 2. **Pedido:** autenticado, con `items`, `delivery_address` y `payment_method: cash_on_delivery`. Estados: `placed → confirmed → preparing → out_for_delivery → delivered`, con cancelación antes del despacho.
 3. **Pago:** se crea `pending`; el admin lo marca `paid` solo si el pedido está `delivered`. No hay pasarela de tarjeta.
 4. **Calificación:** solo el dueño de un pedido `delivered`, una vez, con 1–5 estrellas.
@@ -259,6 +259,7 @@ Observabilidad (admin salvo `/health`):
 Negocio:
 
 - `GET /api/catalogo/products?limit=&offset=`, `GET /api/catalogo/products/{id}` (público).
+- `GET /api/catalogo/products?include_inactive=true` — incluye retirados (solo admin).
 - `POST|PATCH|DELETE /api/catalogo/products…` (admin).
 - `POST /api/pedidos/orders` — `items`, `delivery_address`, `payment_method: "cash_on_delivery"`, `Idempotency-Key`.
 - `GET /api/pedidos/orders`, `GET /api/pedidos/orders/{id}`, `PATCH /api/pedidos/orders/{id}/cancel`.

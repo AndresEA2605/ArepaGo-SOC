@@ -290,7 +290,11 @@ class Handler(JsonHandler):
             required_role = "admin" if method == "PATCH" else "customer_or_admin"
         elif path == "/api/catalogo" or path.startswith("/api/catalogo/"):
             if method == "GET":
-                return None
+                # El catálogo es público, pero si hay una sesión válida se
+                # propaga la identidad para que el admin pueda ver los
+                # productos retirados y republicarlos.
+                user = self.load_session_user()
+                return None if user is False or user is None else user
             required_role = "admin"
         elif path.startswith(("/api/views", "/api/telemetry", "/api/incidents")):
             required_role = "admin"

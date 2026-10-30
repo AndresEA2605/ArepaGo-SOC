@@ -225,7 +225,7 @@ El repositorio está endurecido, pero el despliegue público depende de infraest
 4. **Capacidad:** 12 procesos con pool × 10 = 120 conexiones locales. Recalcula al escalar. `auth`, `telemetry`, `incidents`, `views` y `reports` corren con una réplica; si escalas auth, mueve el rate limiting a Redis/PostgreSQL.
 5. **Observabilidad:** envía logs a CloudWatch o a un colector central y configura alertas externas sobre `/health`, 5xx, latencia y pool. Las mediciones no se purgan solas.
 6. **Datos:** publica el menú real; no ejecutes `seed_demo_catalog.py` ni los scripts de smoke/incidentes contra producción.
-7. **Entrega:** el CI compila, prueba, valida Compose y construye la imagen. Añade escaneo (Trivy) y un pipeline de despliegue con migraciones controladas.
+7. **Entrega:** antes de desplegar, ejecuta las pruebas, la compilación, la validación de Compose y el build de la imagen. Añade escaneo (Trivy) y un pipeline de despliegue con migraciones controladas.
 8. **Límites conocidos:** sin migraciones versionadas (los servicios usan `CREATE TABLE IF NOT EXISTS`), sin WAF/DDoS propio, rate limiting por proceso y sin alertas integradas.
 
 ## API
@@ -277,7 +277,7 @@ python3 -m unittest discover -s tests -v      # 56 pruebas
 python3 -m compileall -q services scripts tests
 ```
 
-El CI (`.github/workflows/ci.yml`) repite `pip check`, compilación, pruebas, validación de Compose (base + RDS) y build de la imagen. El flujo completo se validó contra contenedores locales: catálogo, pedido, entrega, pago, calificación, identidad interna y rate limiting.
+La validación local incluye `pip check`, compilación, pruebas, validación de Compose (base + RDS) y build de la imagen. El flujo completo se validó contra contenedores locales: catálogo, pedido, entrega, pago, calificación, identidad interna y rate limiting.
 
 Scripts auxiliares (**solo local**, nunca contra producción):
 

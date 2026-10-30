@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse, urlsplit
 from services.common import JsonHandler
 from services.db import connection, init_pool, pool_stats
 from services.internal_auth import IDENTITY_HEADER, load_secret, verify_identity
+from services.migrations import apply_migrations
 from services.order_states import ORDER_TRANSITIONS, can_confirm_cash_payment, can_manage_payment, can_transition_order
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "servicio").strip().lower()
@@ -63,16 +64,11 @@ def parse_price(value):
     return price
 
 
-def initialize():
-    if SERVICE_NAME not in SCHEMAS:
-        raise RuntimeError(f"SERVICE_NAME no reconocido: {SERVICE_NAME}")
-    schema = SCHEMAS[SERVICE_NAME]
-    init_pool(f"arepago-{SERVICE_NAME}")
-    with connection() as db:
-        db.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"arepago-schema-{SERVICE_NAME}",))
-        db.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-        if SERVICE_NAME == "catalogo":
-            db.execute(f"""CREATE TABLE IF NOT EXISTS {schema}.products (
+def _migrations(schema):
+    if SERVICE_NAME == "catalogo":
+        return [(1, "catalog schema", [
+            f"CREATE SCHEMA IF NOT EXISTS {schema}",
+            f"""CREATE TABLE IF NOT EXISTS {schema}.products (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 name TEXT NOT NULL CHECK (length(name) BETWEEN 2 AND 120),
                 description TEXT NOT NULL DEFAULT '',
@@ -81,10 +77,13 @@ def initialize():
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )""")
-            db.execute(f"CREATE INDEX IF NOT EXISTS products_active_name ON {schema}.products(active,name)")
-        elif SERVICE_NAME == "pedidos":
-            db.execute(f"""CREATE TABLE IF NOT EXISTS {schema}.orders (
+            )""",
+            f"CREATE INDEX IF NOT EXISTS products_active_name ON {schema}.products(active,name)",
+        ])]
+    if SERVICE_NAME == "pedidos":
+        return [(1, "orders schema", [
+            f"CREATE SCHEMA IF NOT EXISTS {schema}",
+            f"""CREATE TABLE IF NOT EXISTS {schema}.orders (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 customer_id UUID NOT NULL,
                 idempotency_key TEXT NOT NULL,
@@ -95,19 +94,22 @@ def initialize():
                 eta TIMESTAMPTZ NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )""")
-            db.execute(f"""CREATE TABLE IF NOT EXISTS {schema}.order_items (
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS {schema}.order_items (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 order_id UUID NOT NULL REFERENCES {schema}.orders(id) ON DELETE CASCADE,
                 product_id UUID NOT NULL,
                 product_name TEXT NOT NULL,
                 unit_price NUMERIC(10,2) NOT NULL CHECK (unit_price > 0),
                 quantity INTEGER NOT NULL CHECK (quantity BETWEEN 1 AND 50)
-            )""")
-            db.execute(f"CREATE INDEX IF NOT EXISTS orders_customer_created ON {schema}.orders(customer_id,created_at DESC)")
-            db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS orders_customer_idempotency ON {schema}.orders(customer_id,idempotency_key)")
-        elif SERVICE_NAME == "pagos":
-            db.execute(f"""CREATE TABLE IF NOT EXISTS {schema}.payments (
+            )""",
+            f"CREATE INDEX IF NOT EXISTS orders_customer_created ON {schema}.orders(customer_id,created_at DESC)",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS orders_customer_idempotency ON {schema}.orders(customer_id,idempotency_key)",
+        ])]
+    if SERVICE_NAME == "pagos":
+        return [(1, "payments schema", [
+            f"CREATE SCHEMA IF NOT EXISTS {schema}",
+            f"""CREATE TABLE IF NOT EXISTS {schema}.payments (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 order_id UUID NOT NULL UNIQUE,
                 customer_id UUID NOT NULL,
@@ -116,20 +118,32 @@ def initialize():
                 amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )""")
-            db.execute(f"CREATE INDEX IF NOT EXISTS payments_customer_created ON {schema}.payments(customer_id,created_at DESC)")
-            db.execute(f"ALTER TABLE {schema}.payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ")
-            db.execute(f"ALTER TABLE {schema}.payments ADD COLUMN IF NOT EXISTS confirmed_by UUID")
-        elif SERVICE_NAME == "calificaciones":
-            db.execute(f"""CREATE TABLE IF NOT EXISTS {schema}.ratings (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                order_id UUID NOT NULL UNIQUE,
-                customer_id UUID NOT NULL,
-                score SMALLINT NOT NULL CHECK (score BETWEEN 1 AND 5),
-                comment TEXT NOT NULL DEFAULT '' CHECK (length(comment) <= 1000),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )""")
-            db.execute(f"CREATE INDEX IF NOT EXISTS ratings_customer_created ON {schema}.ratings(customer_id,created_at DESC)")
+            )""",
+            f"CREATE INDEX IF NOT EXISTS payments_customer_created ON {schema}.payments(customer_id,created_at DESC)",
+            f"ALTER TABLE {schema}.payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+            f"ALTER TABLE {schema}.payments ADD COLUMN IF NOT EXISTS confirmed_by UUID",
+        ])]
+    return [(1, "ratings schema", [
+        f"CREATE SCHEMA IF NOT EXISTS {schema}",
+        f"""CREATE TABLE IF NOT EXISTS {schema}.ratings (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            order_id UUID NOT NULL UNIQUE,
+            customer_id UUID NOT NULL,
+            score SMALLINT NOT NULL CHECK (score BETWEEN 1 AND 5),
+            comment TEXT NOT NULL DEFAULT '' CHECK (length(comment) <= 1000),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""",
+        f"CREATE INDEX IF NOT EXISTS ratings_customer_created ON {schema}.ratings(customer_id,created_at DESC)",
+    ])]
+
+
+def initialize():
+    if SERVICE_NAME not in SCHEMAS:
+        raise RuntimeError(f"SERVICE_NAME no reconocido: {SERVICE_NAME}")
+    schema = SCHEMAS[SERVICE_NAME]
+    init_pool(f"arepago-{SERVICE_NAME}")
+    with connection() as db:
+        apply_migrations(db, SERVICE_NAME, _migrations(schema))
 
 
 def product_dict(row):

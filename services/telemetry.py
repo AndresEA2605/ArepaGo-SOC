@@ -10,19 +10,23 @@ from urllib.parse import parse_qs, urlparse
 from psycopg.types.json import Jsonb
 from services.common import JsonHandler
 from services.db import connection, init_pool, pool_stats
+from services.measurement_aggregate import aggregate_measurements
+from services.migrations import apply_migrations
 
 SERVICES = {"pedidos", "pagos", "calificaciones", "catalogo"}
 SCHEMA = "soc_telemetry"
 LOG_SERVICES = SERVICES | {"transaction-router", "views", "incidents", "auth", "reports"}
 LOG_RETENTION_DAYS = max(1, min(365, int(os.environ.get("LOG_RETENTION_DAYS", "30"))))
-_last_log_prune = 0.0
-_log_prune_lock = threading.Lock()
+MEASUREMENT_RETENTION_DAYS = max(1, min(3650, int(os.environ.get("MEASUREMENT_RETENTION_DAYS", "30"))))
+# Replicas that stopped reporting must not keep inflating the aggregate forever.
+MEASUREMENT_FRESH_SECONDS = max(0, min(3600, int(os.environ.get("MEASUREMENT_FRESH_SECONDS", "120"))))
+_last_prune = 0.0
+_prune_lock = threading.Lock()
 
-def initialize():
-    init_pool("arepago-telemetry")
-    with connection() as db:
-        db.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.measurements (
+MIGRATIONS = [
+    (1, "measurements and logs", [
+        f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.measurements (
             id UUID PRIMARY KEY,
             timestamp TIMESTAMPTZ NOT NULL,
             service TEXT NOT NULL CHECK (service IN ('pedidos','pagos','calificaciones','catalogo')),
@@ -36,10 +40,10 @@ def initialize():
             diagnostics JSONB NOT NULL DEFAULT '[]'::jsonb,
             CHECK ((db_pool_active IS NULL AND db_pool_max IS NULL) OR
                    (db_pool_active >= 0 AND db_pool_max >= db_pool_active AND db_pool_max > 0))
-        )""")
-        db.execute(f"ALTER TABLE {SCHEMA}.measurements ADD COLUMN IF NOT EXISTS diagnostics JSONB NOT NULL DEFAULT '[]'::jsonb")
-        db.execute(f"CREATE INDEX IF NOT EXISTS measurements_service_time ON {SCHEMA}.measurements(service, timestamp DESC)")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.logs (
+        )""",
+        f"ALTER TABLE {SCHEMA}.measurements ADD COLUMN IF NOT EXISTS diagnostics JSONB NOT NULL DEFAULT '[]'::jsonb",
+        f"CREATE INDEX IF NOT EXISTS measurements_service_time ON {SCHEMA}.measurements(service, timestamp DESC)",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.logs (
             id UUID PRIMARY KEY,
             timestamp TIMESTAMPTZ NOT NULL,
             level TEXT NOT NULL CHECK (level IN ('warning','error','critical')),
@@ -54,8 +58,19 @@ def initialize():
             message TEXT NOT NULL DEFAULT '',
             stack_trace TEXT NOT NULL DEFAULT '',
             details JSONB NOT NULL DEFAULT '{{}}'::jsonb
-        )""")
-        db.execute(f"CREATE INDEX IF NOT EXISTS logs_service_time ON {SCHEMA}.logs(service, timestamp DESC)")
+        )""",
+        f"CREATE INDEX IF NOT EXISTS logs_service_time ON {SCHEMA}.logs(service, timestamp DESC)",
+    ]),
+    (2, "replica-aware measurements", [
+        f"ALTER TABLE {SCHEMA}.measurements ADD COLUMN IF NOT EXISTS replica TEXT",
+        f"CREATE INDEX IF NOT EXISTS measurements_replica_time ON {SCHEMA}.measurements(service, replica, timestamp DESC)",
+    ]),
+]
+
+def initialize():
+    init_pool("arepago-telemetry")
+    with connection() as db:
+        apply_migrations(db, "telemetry", MIGRATIONS)
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -102,6 +117,7 @@ def validate(data):
         raise ValueError("diagnostics excede el tamaño permitido")
     return {"id": measurement_id, "timestamp": timestamp,
         "service": service, "environment": str(data.get("environment") or "production")[:64],
+        "replica": str(data.get("replica") or "").strip()[:128] or None,
         "latency_p95_ms": latency, "request_count": requests, "error_count": errors,
         "db_pool_active": active, "db_pool_max": maximum, "source": str(data.get("source") or "api")[:128],
         "diagnostics": diagnostics}
@@ -175,17 +191,19 @@ def parse_log_time(value, fallback):
     return parsed.astimezone(timezone.utc)
 
 
-def prune_logs_if_due(db):
-    global _last_log_prune
+def prune_if_due(db):
+    global _last_prune
     now_mono = time.monotonic()
-    if now_mono - _last_log_prune < 3600:
+    if now_mono - _last_prune < 3600:
         return
-    with _log_prune_lock:
+    with _prune_lock:
         now_mono = time.monotonic()
-        if now_mono - _last_log_prune >= 3600:
+        if now_mono - _last_prune >= 3600:
             db.execute(f"DELETE FROM {SCHEMA}.logs WHERE timestamp < now() - (%s * INTERVAL '1 day')",
                        (LOG_RETENTION_DAYS,))
-            _last_log_prune = now_mono
+            db.execute(f"DELETE FROM {SCHEMA}.measurements WHERE timestamp < now() - (%s * INTERVAL '1 day')",
+                       (MEASUREMENT_RETENTION_DAYS,))
+            _last_prune = now_mono
 
 class Handler(JsonHandler):
     def do_GET(self):
@@ -204,10 +222,30 @@ class Handler(JsonHandler):
             return
         if parsed.path == "/telemetry/summary":
             with connection() as db:
-                rows = db.execute(f"""SELECT DISTINCT ON (service) * FROM {SCHEMA}.measurements
-                    ORDER BY service, timestamp DESC""").fetchall()
+                if MEASUREMENT_FRESH_SECONDS:
+                    rows = db.execute(f"""SELECT DISTINCT ON (service, COALESCE(replica, 'legacy')) *
+                        FROM {SCHEMA}.measurements
+                        WHERE timestamp >= now() - (%s * INTERVAL '1 second')
+                        ORDER BY service, COALESCE(replica, 'legacy'), timestamp DESC""",
+                        (MEASUREMENT_FRESH_SECONDS,)).fetchall()
+                else:
+                    rows = db.execute(f"""SELECT DISTINCT ON (service, COALESCE(replica, 'legacy')) *
+                        FROM {SCHEMA}.measurements
+                        ORDER BY service, COALESCE(replica, 'legacy'), timestamp DESC""").fetchall()
                 total = db.execute(f"SELECT COUNT(*) AS total FROM {SCHEMA}.measurements").fetchone()["total"]
-            self.send_json(200, {"measurement_count": total, "latest_by_service": [as_dict(row) for row in rows]})
+            grouped = {}
+            for row in rows:
+                item = as_dict(row)
+                grouped.setdefault(item["service"], []).append(item)
+            latest = []
+            for _, group in sorted(grouped.items()):
+                # During a rollout, legacy rows without replica may still be
+                # inside the freshness window. Prefer real replicas and fall
+                # back to the legacy row only when no replica has reported.
+                replica_rows = [item for item in group if item.get("replica")]
+                latest.append(aggregate_measurements(replica_rows or group))
+            self.send_json(200, {"measurement_count": total, "fresh_seconds": MEASUREMENT_FRESH_SECONDS,
+                                 "latest_by_service": latest})
             return
         # Public gateway URLs retain the /telemetry prefix when proxied, while
         # internal log forwarders post directly to /logs. Accept both paths.
@@ -279,7 +317,7 @@ class Handler(JsonHandler):
                     VALUES (%(id)s,%(timestamp)s,%(level)s,%(service)s,%(event)s,%(request_id)s,%(method)s,%(route)s,
                     %(status)s,%(duration_ms)s,%(error_type)s,%(message)s,%(stack_trace)s,%(details)s)""",
                     {**item, "details": Jsonb(item["details"])})
-                prune_logs_if_due(db)
+                prune_if_due(db)
             self.send_json(201, {"id": item["id"], "stored": True})
             return
         if path != "/telemetry":
@@ -292,11 +330,13 @@ class Handler(JsonHandler):
             return
         with connection() as db:
             db.execute(f"""INSERT INTO {SCHEMA}.measurements
-                (id,timestamp,service,environment,latency_p95_ms,request_count,error_count,db_pool_active,db_pool_max,source,diagnostics)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
-                metric["id"], datetime.fromisoformat(metric["timestamp"]), metric["service"], metric["environment"], metric["latency_p95_ms"],
+                (id,timestamp,service,environment,replica,latency_p95_ms,request_count,error_count,db_pool_active,db_pool_max,source,diagnostics)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
+                metric["id"], datetime.fromisoformat(metric["timestamp"]), metric["service"], metric["environment"],
+                metric["replica"], metric["latency_p95_ms"],
                 metric["request_count"], metric["error_count"], metric["db_pool_active"], metric["db_pool_max"], metric["source"],
                 Jsonb(metric["diagnostics"])))
+            prune_if_due(db)
         self.send_json(201, metric)
 
 def main():

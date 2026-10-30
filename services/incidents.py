@@ -2,6 +2,10 @@
 import json
 import ast
 import os
+import threading
+import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -14,6 +18,7 @@ from services.incident_rules import recovery_decision
 from services.internal_auth import IDENTITY_HEADER, load_secret, verify_identity
 from services.incident_simulator import (benchmark_rows, reference_scenario, run_local_benchmark,
                                          simulate_mitigations)
+from services.migrations import apply_migrations
 from services.orders_report import apply_created_at_index, generate_orders_report
 
 LATENCY_THRESHOLD_MS = float(os.environ.get("LATENCY_THRESHOLD_MS", "1000"))
@@ -24,8 +29,16 @@ RECOVERY_SAMPLES_REQUIRED = max(2, min(10, int(os.environ.get("INCIDENT_RECOVERY
 # cierra por inactividad para no dejarlo abierto indefinidamente. 0 lo desactiva.
 INACTIVITY_MINUTES = max(0, min(1440, int(os.environ.get("INCIDENT_INACTIVITY_MINUTES", "30"))))
 INACTIVITY_SECONDS = INACTIVITY_MINUTES * 60
+# Los incidentes resueltos se conservan como evidencia auditable y luego se purgan.
+INCIDENT_RETENTION_DAYS = max(1, min(3650, int(os.environ.get("INCIDENT_RETENTION_DAYS", "180"))))
+EVALUATE_SECONDS = max(5, min(300, int(os.environ.get("INCIDENT_EVALUATE_SECONDS", "15"))))
+TELEMETRY_URL = os.environ.get("TELEMETRY_URL", "http://127.0.0.1:8001")
+UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "4"))
 SERVICES = {"pedidos", "pagos", "calificaciones", "catalogo"}
 SCHEMA = "soc_incidents"
+_last_prune = 0.0
+_prune_lock = threading.Lock()
+_last_sample_keys = {}
 
 
 def current_user(handler):
@@ -86,11 +99,10 @@ def incident_code_context(incident):
             "explanation": explanation, "snippets": unique}
 
 
-def initialize():
-    init_pool("arepago-incidents")
-    with connection() as db:
-        db.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.incidents (
+MIGRATIONS = [
+    (1, "incidents lifecycle", [
+        f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.incidents (
             id UUID PRIMARY KEY,
             service TEXT NOT NULL CHECK (service IN ('pedidos','pagos','calificaciones','catalogo')),
             status TEXT NOT NULL CHECK (status IN ('open','resolved')),
@@ -106,19 +118,30 @@ def initialize():
             recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
             recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED} CHECK (recovery_required >= 2),
             resolution_reason TEXT NOT NULL DEFAULT ''
-        )""")
-        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_reasons JSONB NOT NULL DEFAULT '[]'::jsonb")
-        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_measurement JSONB NOT NULL DEFAULT '{{}}'::jsonb")
-        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_count INTEGER NOT NULL DEFAULT 0")
-        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED}")
-        db.execute(f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS resolution_reason TEXT NOT NULL DEFAULT ''")
+        )""",
+        f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_reasons JSONB NOT NULL DEFAULT '[]'::jsonb",
+        f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS initial_measurement JSONB NOT NULL DEFAULT '{{}}'::jsonb",
+        f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_count INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS recovery_required INTEGER NOT NULL DEFAULT {RECOVERY_SAMPLES_REQUIRED}",
+        f"ALTER TABLE {SCHEMA}.incidents ADD COLUMN IF NOT EXISTS resolution_reason TEXT NOT NULL DEFAULT ''",
         # Preserve the best available opening evidence for incidents created before these columns existed.
-        db.execute(f"""UPDATE {SCHEMA}.incidents SET
+        f"""UPDATE {SCHEMA}.incidents SET
             initial_reasons = CASE WHEN initial_reasons = '[]'::jsonb THEN reasons ELSE initial_reasons END,
             initial_measurement = CASE WHEN initial_measurement = '{{}}'::jsonb THEN latest_measurement ELSE initial_measurement END
-            WHERE initial_reasons = '[]'::jsonb OR initial_measurement = '{{}}'::jsonb""")
-        db.execute(f"CREATE INDEX IF NOT EXISTS incidents_status_started ON {SCHEMA}.incidents(status, started_at DESC)")
-        db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS one_open_incident_per_service ON {SCHEMA}.incidents(service) WHERE status='open'")
+            WHERE initial_reasons = '[]'::jsonb OR initial_measurement = '{{}}'::jsonb""",
+        f"CREATE INDEX IF NOT EXISTS incidents_status_started ON {SCHEMA}.incidents(status, started_at DESC)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS one_open_incident_per_service ON {SCHEMA}.incidents(service) WHERE status='open'",
+    ]),
+    (2, "resolved incident retention", [
+        f"CREATE INDEX IF NOT EXISTS incidents_resolved_at ON {SCHEMA}.incidents(resolved_at) WHERE status='resolved'",
+    ]),
+]
+
+
+def initialize():
+    init_pool("arepago-incidents")
+    with connection() as db:
+        apply_migrations(db, "incidents", MIGRATIONS)
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -200,6 +223,81 @@ def evaluate(metric):
             row = db.execute(f"SELECT * FROM {SCHEMA}.incidents WHERE id=%s", (existing["id"],)).fetchone()
             return {"action": action, "incident": public(row)}
     return {"action": "no_change", "incident": None}
+
+
+def fetch_summary():
+    request = urllib.request.Request(TELEMETRY_URL + "/telemetry/summary",
+                                     headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def prune_incidents_if_due():
+    global _last_prune
+    now_mono = time.monotonic()
+    if now_mono - _last_prune < 3600:
+        return
+    with _prune_lock:
+        now_mono = time.monotonic()
+        if now_mono - _last_prune < 3600:
+            return
+        with connection() as db:
+            db.execute(f"""DELETE FROM {SCHEMA}.incidents
+                WHERE status='resolved'
+                  AND COALESCE(resolved_at, last_seen) < now() - (%s * INTERVAL '1 day')""",
+                (INCIDENT_RETENTION_DAYS,))
+        _last_prune = now_mono
+
+
+def evaluate_forever():
+    """Evaluate the aggregated latest sample of each service on a fixed cadence.
+
+    The gateway only publishes measurements now; Incidents owns the threshold
+    decision. Samples are de-duplicated by their measurement ids so a stable
+    aggregate is not counted twice toward recovery.
+    """
+    while True:
+        time.sleep(EVALUATE_SECONDS)
+        try:
+            summary = fetch_summary()
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            log_event("incident_evaluation_failed", level="warning", service="incidents",
+                      error_type=type(exc).__name__)
+            continue
+        metrics = {item["service"]: item for item in summary.get("latest_by_service", [])
+                   if item.get("service") in SERVICES}
+        for service, metric in metrics.items():
+            sample_key = metric.get("sample_key") or metric.get("timestamp")
+            if _last_sample_keys.get(service) == sample_key:
+                continue
+            try:
+                evaluate(metric)
+                _last_sample_keys[service] = sample_key
+            except Exception as exc:
+                log_event("incident_evaluation_failed", level="warning", service=service,
+                          error_type=type(exc).__name__)
+        # If the gateway stops reporting entirely, keep the inactivity clock
+        # moving with neutral samples instead of leaving the incident open.
+        try:
+            with connection() as db:
+                open_services = {row["service"] for row in db.execute(
+                    f"SELECT DISTINCT service FROM {SCHEMA}.incidents WHERE status='open'").fetchall()}
+        except Exception:
+            open_services = set()
+        for service in open_services - set(metrics):
+            try:
+                evaluate({"service": service, "timestamp": utcnow(), "latency_p95_ms": 0,
+                          "request_count": 0, "error_count": 0, "db_pool_active": None,
+                          "db_pool_max": None, "diagnostics": []})
+            except Exception as exc:
+                log_event("incident_evaluation_failed", level="warning", service=service,
+                          error_type=type(exc).__name__)
+        try:
+            prune_incidents_if_due()
+        except Exception as exc:
+            log_event("incident_retention_failed", level="warning", service="incidents",
+                      error_type=type(exc).__name__)
+
 
 class Handler(JsonHandler):
     def do_GET(self):
@@ -366,6 +464,8 @@ def main():
     load_secret()
     initialize()
     port = int(os.environ.get("PORT", "8002"))
+    evaluator = threading.Thread(target=evaluate_forever, name="incident-evaluator", daemon=True)
+    evaluator.start()
     print(f"incidents service listening on :{port}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 

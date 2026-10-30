@@ -1,6 +1,7 @@
 """Transaction router: routes telemetry and ArepaGo domain traffic."""
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -417,6 +418,7 @@ def sample_metrics_forever():
                 pass
             metric = {"service": service, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       "environment": os.environ.get("APP_ENV", "local"),
+                      "replica": socket.gethostname(),
                       "latency_p95_ms": values["latency_p95_ms"], "request_count": values["request_count"],
                       "error_count": values["error_count"], "diagnostics": values["route_diagnostics"],
                       "db_pool_active": pool.get("active") if pool and pool.get("status") == "ok" else None,
@@ -424,8 +426,10 @@ def sample_metrics_forever():
                       "source": "transaction-router real request observations; DB pool sampled from one service replica"}
             try:
                 code, stored = request_json(TELEMETRY_URL + "/telemetry", "POST", metric)
-                if code == 201:
-                    request_json(INCIDENTS_URL + "/evaluate", "POST", stored)
+                if code != 201:
+                    sys.stderr.write(json.dumps({"level":"error","event":"telemetry_sample_rejected",
+                        "service":service,"status":code})+"\n")
+                    sys.stderr.flush()
             except ConnectionError as exc:
                 sys.stderr.write(json.dumps({"level":"error","event":"telemetry_sample_failed","service":service,"error":str(exc)})+"\n")
                 sys.stderr.flush()

@@ -4,8 +4,9 @@ Aplicación de pedidos de arepas con panel de observabilidad (SOC). Los clientes
 
 - **Local:** `./scripts/start_local.sh` → `http://localhost:8081`
 - **Stack:** 22 contenedores, 2 réplicas de cada servicio de negocio y del enrutador
-- **Pruebas:** `python3 -m unittest discover -s tests -v` (56 pruebas)
+- **Pruebas:** `python3 -m unittest discover -s tests -v` (60 pruebas)
 - **Producción:** ver [Checklist de producción](#checklist-de-producción); el código está endurecido, pero el despliegue público requiere TLS, secretos gestionados, RDS con backups y WAF.
+- **Siglas:** si no te suena ALB, ECS, RDS, WAF, p95 u otro término, consulta el [Glosario de términos](#glosario-de-términos).
 
 ## Arquitectura
 
@@ -73,6 +74,9 @@ Un esquema por módulo, con un pool de conexiones por proceso:
 | `soc_telemetry` | `measurements`, `logs` | Muestras de tráfico y logs estructurados |
 | `soc_incidents` | `incidents` | Incidentes con evidencia inicial, estado y motivo de cierre |
 | `soc_reports` | `reports`, `report_events` | Reportes de clientes y auditoría de cambios de estado |
+| `soc_migrations` | `schema_migrations` | Versión aplicada de cada módulo (DDL transaccional) |
+
+Cada servicio aplica sus migraciones versionadas al arrancar (`services/migrations.py`): `soc_migrations.schema_migrations` registra la versión por módulo y un lock de PostgreSQL evita carreras entre réplicas. La versión 1 reproduce el esquema existente con `IF NOT EXISTS`, así que una base ya poblada se adopta sin recrear tablas.
 
 ### Manejo y retención de datos
 
@@ -82,7 +86,7 @@ Un esquema por módulo, con un pool de conexiones por proceso:
 - **Contraseñas:** `scrypt` (N=2^14, r=8, p=1, 64 bytes) con sal aleatoria. Nunca se guarda la contraseña en claro.
 - **Sesiones:** se guarda solo el SHA-256 del token, con expiración (`SESSION_HOURS`, 12 h por defecto). Las expiradas se purgan al iniciar sesión.
 - **Logs:** mensajes truncados a 4.000 caracteres y trazas a 16.000; rutas normalizadas (`/orders/{id}`) para no almacenar identificadores ni query strings. Los parámetros SQL no se registran.
-- **Retención:** los logs se purgan a los `LOG_RETENTION_DAYS` días (30 por defecto, comprobación cada hora). Las mediciones, incidentes, pedidos y reportes **no** se purgan automáticamente.
+- **Retención:** logs, mediciones e incidentes resueltos se purgan cada hora según `LOG_RETENTION_DAYS` (30), `MEASUREMENT_RETENTION_DAYS` (30) e `INCIDENT_RETENTION_DAYS` (180). Los incidentes abiertos nunca se purgan; pedidos, pagos, calificaciones y reportes se conservan.
 - **Backups:** en local el volumen `postgres-data` conserva todo; para un respaldo lógico usa `pg_dump`. En RDS se usan backups automáticos con point-in-time recovery.
 - **Catálogo inicial:** vacío. Los productos `DEMO · …` quedan inactivos y no se cargan solos; el menú real se publica desde el panel admin. Un producto retirado sigue visible para el admin (marcado como retirado) y puede republicarse sin recrearlo.
 
@@ -113,11 +117,11 @@ El `transaction-router` mide cada petición que reenvía a un servicio de negoci
 - `request_count` y `error_count` (HTTP ≥ 500) desde la muestra anterior,
 - latencia **p95** de las observaciones de la ventana de 15 s,
 - hasta 20 rutas con errores (método, ruta normalizada, conteos y estados),
-- pool de la base (`active`/`max`) consultado a **una** réplica del servicio, marcado en `source`.
+- pool de la base (`active`/`max`) consultado por cada router a una réplica del servicio; el agregado conserva la peor ocupación.
 
-Cada réplica del router publica su propia medición: en un intervalo hay dos filas por servicio y cada una cubre el tráfico que atendió esa réplica. El incidente evalúa cada fila por separado; el panel muestra la más reciente.
+Cada réplica del router publica su propia medición con `replica` (hostname): en un intervalo hay dos filas por servicio y cada una cubre el tráfico que atendió esa réplica. Telemetry agrega la **última muestra de cada réplica**: suma `request_count`/`error_count`, toma el peor p95 y la peor ocupación de pool, y fusiona los diagnósticos. Una réplica que deja de publicar sale del agregado tras `MEASUREMENT_FRESH_SECONDS` (120 s), para no inflar el tráfico con datos viejos.
 
-Las mediciones se guardan en `soc_telemetry.measurements` y se evalúan inmediatamente en `POST /evaluate` del servicio de incidentes.
+Las mediciones se guardan en `soc_telemetry.measurements`. El servicio Incident consulta el agregado cada `INCIDENT_EVALUATE_SECONDS` (15 s) y aplica los umbrales **una vez por servicio**, no por réplica. `POST /evaluate` sigue disponible para evaluación manual o pruebas.
 
 ### Umbrales
 
@@ -142,7 +146,7 @@ Una muestra degradada reinicia el conteo; por eso se requieren muestras **consec
 
 ### Qué detecta y qué no
 
-- **Detecta:** degradación del tráfico que atraviesa el gateway (latencia, 5xx, pool de una réplica) y la conserva como incidente auditable.
+- **Detecta:** degradación del tráfico que atraviesa el gateway (latencia, 5xx, pool de la réplica más saturada) y la conserva como incidente auditable.
 - **No detecta:** fallos internos sin tráfico, errores solo en logs, saturación de disco/CPU, caída de la base que no llegue a responder al gateway, ni problemas de red del ALB.
 - **No alerta:** no hay paging ni notificaciones. `/health` y `/metrics` son para sondas y dashboards externos.
 - **Healthchecks:** son independientes de los incidentes; Compose reinicia contenedores `unhealthy`, pero eso no abre un incidente.
@@ -156,12 +160,14 @@ Cada servicio escribe JSON a stdout y envía asíncrono a Telemetry los eventos 
 | Verificación | Frecuencia |
 |---|---|
 | Muestreo de métricas del router | 15 s (`METRICS_SAMPLE_SECONDS`) |
-| Evaluación de umbrales | Por cada medición (≈15 s) |
+| Evaluación de umbrales | 15 s (`INCIDENT_EVALUATE_SECONDS`) |
 | Healthcheck de contenedores | 15 s (timeout 5 s; 5–6 reintentos; `start_period` 20–60 s) |
 | Refresco del panel | 15 s |
-| Purga de logs vencidos | Cada hora |
+| Purga de logs y mediciones vencidos | Cada hora |
+| Purga de incidentes resueltos | Cada hora |
 | Purga de sesiones expiradas | En cada login |
-| Retención de logs | 30 días (`LOG_RETENTION_DAYS`) |
+| Retención de logs y mediciones | 30 días (`LOG_RETENTION_DAYS`, `MEASUREMENT_RETENTION_DAYS`) |
+| Retención de incidentes resueltos | 180 días (`INCIDENT_RETENTION_DAYS`) |
 | Cierre por inactividad de incidentes | 30 min sin brechas (`INCIDENT_INACTIVITY_MINUTES`) |
 
 ### Timeouts y límites
@@ -223,10 +229,10 @@ El repositorio está endurecido, pero el despliegue público depende de infraest
 2. **Secretos:** AWS Secrets Manager para `db_password`, `admin_password` e `internal_auth_secret`, con rotación que reinicie gateway y servicios.
 3. **RDS:** red privada, cifrado, backups con PITR, Multi-AZ si el SLA lo exige, TLS `verify-full` y `max_connections ≥ réplicas × pool + reserva`.
 4. **Capacidad:** 12 procesos con pool × 10 = 120 conexiones locales. Recalcula al escalar. `auth`, `telemetry`, `incidents`, `views` y `reports` corren con una réplica; si escalas auth, mueve el rate limiting a Redis/PostgreSQL.
-5. **Observabilidad:** envía logs a CloudWatch o a un colector central y configura alertas externas sobre `/health`, 5xx, latencia y pool. Las mediciones no se purgan solas.
+5. **Observabilidad:** envía logs a CloudWatch o a un colector central y configura alertas externas sobre `/health`, 5xx, latencia y pool. Logs, mediciones e incidentes resueltos se purgan según la retención configurada.
 6. **Datos:** publica el menú real; no ejecutes `seed_demo_catalog.py` ni los scripts de smoke/incidentes contra producción.
 7. **Entrega:** antes de desplegar, ejecuta las pruebas, la compilación, la validación de Compose y el build de la imagen. Añade escaneo (Trivy) y un pipeline de despliegue con migraciones controladas.
-8. **Límites conocidos:** sin migraciones versionadas (los servicios usan `CREATE TABLE IF NOT EXISTS`), sin WAF/DDoS propio, rate limiting por proceso y sin alertas integradas.
+8. **Límites conocidos:** sin WAF/DDoS propio, rate limiting por proceso y sin alertas integradas. El esquema se aplica con migraciones versionadas al arrancar; aun así, coordina los despliegues para no solapar versiones incompatibles.
 
 ## API
 
@@ -270,10 +276,124 @@ Negocio:
 
 La ingesta de telemetría exige sesión admin y mismo origen. Los reportes de clientes son registros propios con aislamiento por cuenta; no son agregados de ventas ni incidentes técnicos.
 
+## Glosario de términos
+
+Esta sección explica en lenguaje llano las siglas y conceptos que aparecen en el README. No hace falta memorizarlos: es una referencia para leer el resto del documento.
+
+### Infraestructura y despliegue
+
+| Término | Nombre completo | Qué significa |
+|---|---|---|
+| **ALB** | Application Load Balancer | Balanceador de carga de AWS para HTTP/HTTPS (capa 7). Recibe cada petición y la reparte entre varias réplicas. En local lo imita un Nginx; en AWS es un servicio gestionado. |
+| **Nginx** | *Engine-X* (nombre propio) | Servidor web y proxy inverso. Aquí sirve el frontend estático y hace de ALB interno entre réplicas. |
+| **ECS** | Elastic Container Service | Orquestador de contenedores de AWS. Ejecuta la imagen Docker como tareas/servicios, las reinicia si fallan y las registra en un ALB. |
+| **RDS** | Relational Database Service | PostgreSQL gestionado por AWS: AWS se encarga de backups, cifrado, réplicas y actualizaciones. |
+| **WAF** | Web Application Firewall | Cortafuegos de aplicaciones web. Filtra ataques HTTP (SQLi, XSS, bots) antes de que lleguen al ALB. |
+| **DDoS** | Distributed Denial of Service | Ataque de denegación de servicio distribuido: muchas máquinas saturan un servicio. Se mitiga en el borde (AWS Shield/WAF), no en el código. |
+| **TLS** | Transport Layer Security | Protocolo que cifra HTTP. El ALB termina TLS y reenvía HTTP dentro de la red privada. |
+| **HTTPS** | HTTP over TLS | HTTP cifrado con TLS. |
+| **PITR** | Point-In-Time Recovery | Recuperar la base de datos a un instante concreto usando backups + logs. |
+| **Multi-AZ** | Multi-Availability Zone | Desplegar en varias zonas de disponibilidad para sobrevivir a la caída de un centro de datos. |
+| **SLA** | Service Level Agreement | Acuerdo de nivel de servicio: disponibilidad/rendimiento prometido al cliente. |
+| **SLO** | Service Level Objective | Objetivo interno medible (por ejemplo, 99,9 % de peticiones por debajo de 1 s). |
+| **CI** | Continuous Integration | Integración continua: compilar y probar automáticamente cada cambio. En este repo se ejecuta en local; el workflow de GitHub se retiró. |
+| **CD** | Continuous Delivery/Deployment | Entrega/despliegue continuo: automatizar la publicación a producción. |
+| **Docker** | — | Plataforma de contenedores: empaqueta la app y sus dependencias en una imagen. |
+| **Docker Compose** | — | Herramienta para definir y levantar varios contenedores con un archivo YAML. |
+| **Contenedor** | — | Proceso aislado que ejecuta una imagen y comparte el kernel del host. |
+| **Imagen** | — | Plantilla inmutable con el código y las dependencias de un contenedor. |
+| **UID/GID** | User ID / Group ID | Identificador numérico de usuario/grupo en Linux. Se usa para que el contenedor corra sin privilegios. |
+| **Secrets Manager** | AWS Secrets Manager | Servicio de AWS para guardar y rotar contraseñas y claves fuera del código. |
+| **CloudWatch** | Amazon CloudWatch | Servicio de AWS para recoger logs, métricas y alarmas. |
+| **Trivy** | — | Escáner de vulnerabilidades de imágenes de contenedor y dependencias. |
+
+### Red, proxies y balanceo
+
+| Término | Nombre completo | Qué significa |
+|---|---|---|
+| **Proxy inverso** | Reverse proxy | Servidor que recibe peticiones de clientes y las reenvía a servicios internos; centraliza TLS, cabeceras y límites. |
+| **Upstream** | — | Servidor destino al que un proxy reenvía la petición (aquí, una réplica de un servicio). |
+| **Balanceo de carga** | Load balancing | Repartir peticiones entre varias réplicas para escalar y tolerar fallos. |
+| **Réplica** | Replica | Otra instancia del mismo proceso que atiende el mismo servicio. No es una copia de la base de datos. |
+| **Failover** | — | Conmutación automática a otra réplica cuando una falla. |
+| **DNS** | Domain Name System | Traduce nombres (`pedidos-service`) a direcciones IP. |
+| **X-Forwarded-For** | — | Cabecera HTTP que añade el proxy con la IP original del cliente. |
+| **Healthcheck** | — | Comprobación periódica de que un servicio responde. Docker/ALB la usan para reiniciar o sacar de rotación una réplica. |
+| **Borde (edge)** | — | Primera capa que toca la petición (ALB/Nginx). |
+| **API** | Application Programming Interface | Contrato de funciones/rutas que un programa ofrece a otro. Aquí son rutas HTTP que devuelven JSON. |
+| **JSON** | JavaScript Object Notation | Formato de texto para intercambiar datos estructurados. |
+
+### Seguridad
+
+| Término | Nombre completo | Qué significa |
+|---|---|---|
+| **SOC** | Security Operations Center | Centro de operaciones de seguridad: personas y procesos que vigilan y responden a incidentes. Aquí da nombre al panel de observabilidad. |
+| **HMAC** | Hash-based Message Authentication Code | Firma con clave secreta. El router firma `{user_id, role, exp}` y los servicios verifican que no fue alterado. |
+| **SHA-256** | Secure Hash Algorithm, 256 bits | Función hash criptográfica. Se usa para guardar el hash del token de sesión, no el token en claro. |
+| **TTL** | Time To Live | Tiempo de vida. La identidad interna caduca a los 120 s. |
+| **scrypt** | — | Algoritmo de derivación de contraseñas deliberadamente costoso; dificulta la fuerza bruta. |
+| **Salt (sal)** | — | Valor aleatorio añadido a la contraseña antes de hashearla; dos contraseñas iguales producen hashes distintos. |
+| **CSRF** | Cross-Site Request Forgery | Ataque que hace que el navegador del usuario envíe una petición no deseada. Se mitiga exigiendo `Origin` del mismo sitio. |
+| **CORS** | Cross-Origin Resource Sharing | Reglas del navegador para permitir peticiones entre orígenes distintos. Aquí no se abre: mismo origen. |
+| **CSP** | Content Security Policy | Cabecera que limita de qué fuentes se pueden cargar scripts, estilos e imágenes. |
+| **HSTS** | HTTP Strict Transport Security | Cabecera que obliga al navegador a usar HTTPS durante un tiempo. |
+| **Cookie HttpOnly** | — | Cookie que JavaScript no puede leer; reduce el robo de sesión por XSS. |
+| **SameSite=Strict** | — | El navegador no envía la cookie en peticiones iniciadas desde otro sitio; ayuda contra CSRF. |
+| **Secure (cookie)** | — | La cookie solo se envía por HTTPS. |
+| **XSS** | Cross-Site Scripting | Inyección de JavaScript malicioso en una página. |
+| **SQLi** | SQL Injection | Inyección de SQL malicioso en consultas. |
+| **Rate limiting** | Limitación de tasa | Limitar cuántas peticiones puede hacer un cliente en una ventana de tiempo. |
+| **Ventana deslizante** | Sliding window | Técnica de rate limiting que cuenta las peticiones de los últimos N segundos, no bloques fijos. |
+| **Idempotencia** | Idempotency | Propiedad por la que repetir la misma operación produce el mismo resultado y no duplica datos. El checkout usa `Idempotency-Key`. |
+
+### Datos y base de datos
+
+| Término | Nombre completo | Qué significa |
+|---|---|---|
+| **PostgreSQL** | — | Base de datos relacional de código abierto. |
+| **psycopg** | — | Driver de Python para PostgreSQL. |
+| **Pool de conexiones** | Connection pool | Conjunto reutilizable de conexiones a la base de datos; evita abrir una conexión por petición. |
+| **Esquema** | Schema | Espacio de nombres que agrupa tablas (`soc_auth`, `soc_orders`...). |
+| **DDL** | Data Definition Language | Sentencias que definen estructura (`CREATE TABLE`, `ALTER TABLE`). |
+| **Migración** | Migration | Cambio de esquema versionado y reproducible. |
+| **JSONB** | JSON Binary | Tipo de PostgreSQL que guarda JSON binario, indexable y consultable. |
+| **UUID** | Universally Unique Identifier | Identificador de 128 bits; aquí se usa como clave primaria. |
+| **Transacción** | Transaction | Conjunto de operaciones que se confirman todas o se revierten todas. |
+| **Lock asesorado** | Advisory lock | Cerradura de PostgreSQL que la aplicación usa para coordinar procesos (por ejemplo, migraciones o evaluación de incidentes). |
+| **SQL** | Structured Query Language | Lenguaje para consultar y modificar bases de datos relacionales. |
+
+### Observabilidad
+
+| Término | Nombre completo | Qué significa |
+|---|---|---|
+| **Telemetría** | Telemetry | Datos automáticos sobre el comportamiento del sistema: tráfico, latencia, errores, pool. |
+| **Métrica** | Metric | Valor numérico medido en el tiempo (peticiones, errores, latencia). |
+| **Log** | — | Registro textual estructurado de un evento. |
+| **Incidente** | Incident | Degradación detectada que se registra, se sigue y se cierra con evidencia. |
+| **Severidad** | Severity | Gravedad del incidente: `warning` o `critical`. |
+| **p95** | Percentil 95 | Ver la explicación detallada siguiente. |
+| **Tasa de error** | Error rate | `errores / peticiones`. Aquí cuenta HTTP ≥ 500. |
+| **Pool saturado** | Pool saturation | Porcentaje de conexiones ocupadas sobre el máximo del pool. |
+| **Umbral** | Threshold | Valor a partir del cual se considera que hay degradación. |
+| **Alertas / paging** | Alerting / paging | Avisar a una persona cuando algo falla. Este proyecto no las incluye; se conectan sondas externas. |
+| **On-call** | — | Persona de guardia que responde a alertas. |
+
+### ¿Qué significa “latencia p95”?
+
+La **latencia** es cuánto tarda una petición desde que llega hasta que responde. Si miras solo el promedio, una minoría de peticiones muy lentas puede quedar oculta. El **percentil 95 (p95)** responde a esta pregunta:
+
+> Si ordenas todas las peticiones de la ventana de menor a mayor, el p95 es el tiempo por debajo del cual queda el 95 % de ellas. El 5 % restante tardó igual o más.
+
+Ejemplo con 20 peticiones ordenadas: 10, 12, 15, 18, 20, 22, 25, 30, 35, 40, 45, 50, 60, 80, 100, 120, 150, 200, 300 y 900 ms. El p95 está entre la posición 19 y la 20 (300–900 ms); en la práctica se toma un valor cercano a 300 ms. Eso significa que 19 de 20 usuarios tuvieron ≤ 300 ms y uno tuvo 900 ms. El promedio, en cambio, sería ~130 ms y escondería esa cola lenta.
+
+Por eso el umbral de este proyecto es **p95 ≥ 1.000 ms**: no reacciona a un único pico aislado, sino a que una parte relevante del tráfico ya sea lenta. El p95 se calcula sobre las observaciones reales de la ventana de muestreo (15 s) y se agrega entre réplicas tomando el peor valor.
+
+Los percentiles cercanos se leen igual: **p50** es la mediana (la mitad de las peticiones son más rápidas), **p99** es el 1 % más lento. Cuanto más alto el percentil, más sensible es a la cola lenta.
+
 ## Pruebas y validación
 
 ```sh
-python3 -m unittest discover -s tests -v      # 56 pruebas
+python3 -m unittest discover -s tests -v      # 60 pruebas
 python3 -m compileall -q services scripts tests
 ```
 

@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from services.common import JsonHandler
 from services.db import connection, init_pool, pool_stats
+from services.migrations import apply_migrations
 from services.rate_limit import SlidingWindowLimiter, resolve_client_ip
 
 SCHEMA = "soc_auth"
@@ -91,25 +92,32 @@ def bootstrap_admin(db):
             raise RuntimeError("ADMIN_EMAIL ya pertenece a una cuenta que no es un administrador activo")
 
 
-def initialize():
-    init_pool("arepago-auth")
-    with connection() as db:
-        db.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.users (
+MIGRATIONS = [
+    (1, "users and sessions", [
+        f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK (role IN ('admin','customer')),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             disabled_at TIMESTAMPTZ
-        )""")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.sessions (
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.sessions (
             token_hash CHAR(64) PRIMARY KEY,
             user_id UUID NOT NULL REFERENCES {SCHEMA}.users(id) ON DELETE CASCADE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             expires_at TIMESTAMPTZ NOT NULL
-        )""")
-        db.execute(f"CREATE INDEX IF NOT EXISTS sessions_expiry ON {SCHEMA}.sessions(expires_at)")
+        )""",
+        f"CREATE INDEX IF NOT EXISTS sessions_expiry ON {SCHEMA}.sessions(expires_at)",
+    ]),
+]
+
+
+def initialize():
+    init_pool("arepago-auth")
+    with connection() as db:
+        apply_migrations(db, "auth", MIGRATIONS)
         bootstrap_admin(db)
 
 

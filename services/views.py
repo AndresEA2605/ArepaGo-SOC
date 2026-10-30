@@ -47,6 +47,8 @@ def load_read_model():
             "service": service,
             "status": incident["severity"] if incident else ("ok" if metric else "no_data"),
             "latest_measurement": metric,
+            "replica_count": metric.get("replica_count", 0) if metric else 0,
+            "replicas": metric.get("replicas", []) if metric else [],
             "error_rate": round(error_count / request_count, 4) if request_count else 0.0,
             "db_pool_ratio": round(pool_active / pool_max, 4) if pool_active is not None and pool_max else None,
             "open_incident": incident,

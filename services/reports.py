@@ -7,16 +7,16 @@ from urllib.parse import parse_qs, urlparse
 from services.common import JsonHandler, log_event
 from services.db import connection, init_pool, pool_stats
 from services.internal_auth import IDENTITY_HEADER, load_secret, verify_identity
+from services.migrations import apply_migrations
 from services.report_rules import REPORT_CATEGORIES, REPORT_STATUSES, can_transition_report, validate_report
 
 SCHEMA = "soc_reports"
 
 
-def initialize():
-    init_pool("arepago-reports")
-    with connection() as db:
-        db.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.reports (
+MIGRATIONS = [
+    (1, "reports and audit events", [
+        f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.reports (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), customer_id UUID NOT NULL,
             category TEXT NOT NULL CHECK (category IN ('web_issue','store_complaint')),
             subject TEXT NOT NULL CHECK (length(subject) BETWEEN 5 AND 160),
@@ -24,15 +24,23 @@ def initialize():
             status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','in_review','resolved','closed')),
             admin_response TEXT NOT NULL DEFAULT '' CHECK (length(admin_response) <= 4000),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        db.execute(f"CREATE INDEX IF NOT EXISTS reports_created ON {SCHEMA}.reports(created_at DESC)")
-        db.execute(f"CREATE INDEX IF NOT EXISTS reports_customer_created ON {SCHEMA}.reports(customer_id,created_at DESC)")
-        db.execute(f"CREATE INDEX IF NOT EXISTS reports_status_created ON {SCHEMA}.reports(status,created_at DESC)")
-        db.execute(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.report_events (
+        )""",
+        f"CREATE INDEX IF NOT EXISTS reports_created ON {SCHEMA}.reports(created_at DESC)",
+        f"CREATE INDEX IF NOT EXISTS reports_customer_created ON {SCHEMA}.reports(customer_id,created_at DESC)",
+        f"CREATE INDEX IF NOT EXISTS reports_status_created ON {SCHEMA}.reports(status,created_at DESC)",
+        f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.report_events (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), report_id UUID NOT NULL REFERENCES {SCHEMA}.reports(id) ON DELETE CASCADE,
             actor_id UUID NOT NULL, previous_status TEXT, new_status TEXT NOT NULL, response TEXT NOT NULL DEFAULT '',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
-        db.execute(f"CREATE INDEX IF NOT EXISTS report_events_created ON {SCHEMA}.report_events(report_id,created_at)")
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
+        f"CREATE INDEX IF NOT EXISTS report_events_created ON {SCHEMA}.report_events(report_id,created_at)",
+    ]),
+]
+
+
+def initialize():
+    init_pool("arepago-reports")
+    with connection() as db:
+        apply_migrations(db, "reports", MIGRATIONS)
 
 
 def current_user(handler):

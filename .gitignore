@@ -3,4 +3,7 @@ __pycache__/
 *.py[cod]
 *.sqlite3
 secrets/db_password.txt
+secrets/admin_password.txt
+secrets/test_customer_password.txt
+secrets/internal_auth_secret.txt
 secrets/global-bundle.pem

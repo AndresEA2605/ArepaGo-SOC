@@ -1,0 +1,10 @@
+
+Iniciar:
+
+./scripts/start_local.sh
+
+Cerrar:
+
+./scripts/stop_local.sh
+
+Abrir ArepaGo: http://localhost:8081

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check dependency consistency
+        run: python -m pip check
+
+      - name: Compile Python sources
+        run: python -m compileall -q services scripts tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate Compose files
+        run: |
+          mkdir -p secrets
+          printf 'ci-db-password-1234\n' > secrets/db_password.txt
+          printf 'ci-admin-password-1234\n' > secrets/admin_password.txt
+          printf 'ci-internal-auth-secret-with-at-least-32-bytes\n' > secrets/internal_auth_secret.txt
+          printf 'ci-ca-bundle\n' > secrets/global-bundle.pem
+          docker compose config >/dev/null
+          docker compose -f docker-compose.yml -f docker-compose.rds.yml config >/dev/null
+
+      - name: Build container image
+        run: docker build -t arepago-soc:ci .

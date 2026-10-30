@@ -1,6 +1,39 @@
+x-nginx-root-healthcheck: &nginx-root-healthcheck
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-nginx-healthcheck: &nginx-healthcheck
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
+x-app-healthcheck: &app-healthcheck
+  test: ["CMD-SHELL", "python -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/health', timeout=3)\""]
+  interval: 15s
+  timeout: 5s
+  retries: 6
+  start_period: 60s
+
+x-router-healthcheck: &router-healthcheck
+  test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)\""]
+  interval: 15s
+  timeout: 5s
+  retries: 6
+  start_period: 20s
+
 services:
   edge-alb:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     ports:
       - "8081:80"
     volumes:
@@ -8,101 +41,126 @@ services:
     depends_on:
       - transaction-router
       - frontend-service
+    healthcheck: *nginx-root-healthcheck
     restart: unless-stopped
+    logging: *default-logging
 
   frontend-service:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     volumes:
       - ./client:/usr/share/nginx/html:ro
+    healthcheck: *nginx-root-healthcheck
     restart: unless-stopped
+    logging: *default-logging
 
   transaction-router:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     command: ["python", "-m", "services.gateway"]
     environment:
+      SERVICE_NAME: transaction-router
       PORT: "8080"
+      APP_ENV: ${APP_ENV:-local}
       TELEMETRY_URL: http://telemetry-service:8001
       INCIDENTS_URL: http://incident-service:8002
       VIEWS_URL: http://views-service:8003
+      AUTH_URL: http://auth-service:8004
+      REPORTS_URL: http://reports-service:8005
+      SESSION_HOURS: ${SESSION_HOURS:-12}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-4}
+      METRICS_SAMPLE_SECONDS: ${METRICS_SAMPLE_SECONDS:-15}
       PEDIDOS_ALB_URL: http://pedidos-alb
       PAGOS_ALB_URL: http://pagos-alb
       CALIFICACIONES_ALB_URL: http://calificaciones-alb
       CATALOGO_ALB_URL: http://catalogo-alb
+      INTERNAL_AUTH_SECRET_FILE: /run/secrets/internal_auth_secret
+    secrets:
+      - internal_auth_secret
     depends_on:
-      - telemetry-service
-      - incident-service
-      - views-service
-      - pedidos-alb
-      - pagos-alb
-      - calificaciones-alb
-      - catalogo-alb
+      telemetry-service:
+        condition: service_healthy
+      incident-service:
+        condition: service_healthy
+      views-service:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      reports-service:
+        condition: service_healthy
+      pedidos-alb:
+        condition: service_started
+      pagos-alb:
+        condition: service_started
+      calificaciones-alb:
+        condition: service_started
+      catalogo-alb:
+        condition: service_started
+    healthcheck: *router-healthcheck
     deploy:
       replicas: 2
     restart: unless-stopped
+    logging: *default-logging
 
   pedidos-alb:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     volumes:
       - ./infra/nginx/pedidos.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - pedidos-service
+    healthcheck: *nginx-healthcheck
     restart: unless-stopped
+    logging: *default-logging
   pagos-alb:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     volumes:
       - ./infra/nginx/pagos.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - pagos-service
+    healthcheck: *nginx-healthcheck
     restart: unless-stopped
+    logging: *default-logging
   calificaciones-alb:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     volumes:
       - ./infra/nginx/calificaciones.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - calificaciones-service
+    healthcheck: *nginx-healthcheck
     restart: unless-stopped
+    logging: *default-logging
   catalogo-alb:
-    image: nginx:stable-alpine
+    image: nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
     volumes:
       - ./infra/nginx/catalogo.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - catalogo-service
+    healthcheck: *nginx-healthcheck
     restart: unless-stopped
+    logging: *default-logging
 
   pedidos-service:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     command: ["python", "-m", "services.business"]
-    environment: { SERVICE_NAME: pedidos, PORT: "8000" }
-    deploy:
-      replicas: 2
-    restart: unless-stopped
-  pagos-service:
-    build: .
-    command: ["python", "-m", "services.business"]
-    environment: { SERVICE_NAME: pagos, PORT: "8000" }
-    deploy:
-      replicas: 2
-    restart: unless-stopped
-  calificaciones-service:
-    build: .
-    command: ["python", "-m", "services.business"]
-    environment: { SERVICE_NAME: calificaciones, PORT: "8000" }
-    deploy:
-      replicas: 2
-    restart: unless-stopped
-  catalogo-service:
-    build: .
-    command: ["python", "-m", "services.business"]
-    environment: { SERVICE_NAME: catalogo, PORT: "8000" }
-    deploy:
-      replicas: 2
-    restart: unless-stopped
-
-  telemetry-service:
-    build: .
-    command: ["python", "-m", "services.telemetry"]
-    environment: &postgres_app_env
-      PORT: "8001"
+    environment: &business_service_env
+      SERVICE_NAME: pedidos
+      PORT: "8000"
+      TELEMETRY_URL: http://telemetry-service:8001
       DB_HOST: ${DB_HOST:-postgres}
       DB_PORT: ${DB_PORT:-5432}
       DB_NAME: ${DB_NAME:-arepagosoc}
@@ -111,40 +169,235 @@ services:
       DB_SSLMODE: ${DB_SSLMODE:-disable}
       DB_SSLROOTCERT: ${DB_SSLROOTCERT:-}
       DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
-      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-5}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
       DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-10}
+      DB_POOL_MAX_LIFETIME_SECONDS: ${DB_POOL_MAX_LIFETIME_SECONDS:-1800}
+      DB_POOL_MAX_IDLE_SECONDS: ${DB_POOL_MAX_IDLE_SECONDS:-300}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-15000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_TX_TIMEOUT_MS: ${DB_IDLE_TX_TIMEOUT_MS:-30000}
+      SLOW_QUERY_MS: ${SLOW_QUERY_MS:-500}
+      INTERNAL_AUTH_SECRET_FILE: /run/secrets/internal_auth_secret
+      CATALOG_API_URL: http://catalogo-alb
+      PAYMENTS_API_URL: http://pagos-alb
+      ORDERS_API_URL: http://pedidos-alb
     secrets:
       - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
+    deploy:
+      replicas: 2
     restart: unless-stopped
+    logging: *default-logging
+  pagos-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.business"]
+    environment:
+      <<: *business_service_env
+      SERVICE_NAME: pagos
+    secrets:
+      - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+    logging: *default-logging
+  calificaciones-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.business"]
+    environment:
+      <<: *business_service_env
+      SERVICE_NAME: calificaciones
+    secrets:
+      - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+    logging: *default-logging
+  catalogo-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.business"]
+    environment:
+      <<: *business_service_env
+      SERVICE_NAME: catalogo
+    secrets:
+      - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+    logging: *default-logging
+
+  telemetry-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.telemetry"]
+    environment: &postgres_app_env
+      SERVICE_NAME: telemetry
+      PORT: "8001"
+      TELEMETRY_URL: http://telemetry-service:8001
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-arepagosoc}
+      DB_USER: ${DB_USER:-arepagosoc_app}
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      DB_SSLROOTCERT: ${DB_SSLROOTCERT:-}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-10}
+      DB_POOL_MAX_LIFETIME_SECONDS: ${DB_POOL_MAX_LIFETIME_SECONDS:-1800}
+      DB_POOL_MAX_IDLE_SECONDS: ${DB_POOL_MAX_IDLE_SECONDS:-300}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-15000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-5000}
+      DB_IDLE_TX_TIMEOUT_MS: ${DB_IDLE_TX_TIMEOUT_MS:-30000}
+      SLOW_QUERY_MS: ${SLOW_QUERY_MS:-500}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+    secrets:
+      - db_password
+    healthcheck: *app-healthcheck
+    restart: unless-stopped
+    logging: *default-logging
 
   incident-service:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     command: ["python", "-m", "services.incidents"]
     environment:
       <<: *postgres_app_env
+      SERVICE_NAME: incidents
       PORT: "8002"
       LATENCY_THRESHOLD_MS: "1000"
       ERROR_RATE_THRESHOLD: "0.20"
       POOL_WARNING_RATIO: "0.75"
+      INCIDENT_RECOVERY_SAMPLES: ${INCIDENT_RECOVERY_SAMPLES:-3}
+      INTERNAL_AUTH_SECRET_FILE: /run/secrets/internal_auth_secret
     secrets:
       - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
     restart: unless-stopped
+    logging: *default-logging
 
   views-service:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     command: ["python", "-m", "services.views"]
     environment:
+      SERVICE_NAME: views
       PORT: "8003"
       TELEMETRY_URL: http://telemetry-service:8001
       INCIDENTS_URL: http://incident-service:8002
     depends_on:
-      - telemetry-service
-      - incident-service
+      telemetry-service:
+        condition: service_healthy
+      incident-service:
+        condition: service_healthy
+    healthcheck: *app-healthcheck
     restart: unless-stopped
+    logging: *default-logging
+
+  auth-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.auth"]
+    environment:
+      <<: *postgres_app_env
+      SERVICE_NAME: auth
+      PORT: "8004"
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@arepago.local}
+      ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      SESSION_HOURS: ${SESSION_HOURS:-12}
+    secrets:
+      - db_password
+      - admin_password
+    healthcheck: *app-healthcheck
+    restart: unless-stopped
+    logging: *default-logging
+
+  reports-service:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["python", "-m", "services.reports"]
+    environment:
+      <<: *postgres_app_env
+      SERVICE_NAME: reports
+      PORT: "8005"
+      INTERNAL_AUTH_SECRET_FILE: /run/secrets/internal_auth_secret
+    secrets:
+      - db_password
+      - internal_auth_secret
+    healthcheck: *app-healthcheck
+    restart: unless-stopped
+    logging: *default-logging
 
   postgres:
-    image: postgres:18.6-alpine
+    image: postgres:18.6-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     profiles: ["local"]
+    command: ["postgres", "-c", "max_connections=250"]
     environment:
       POSTGRES_DB: ${DB_NAME:-arepagosoc}
       POSTGRES_USER: ${DB_USER:-arepagosoc_app}
@@ -159,6 +412,7 @@ services:
       timeout: 3s
       retries: 12
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres-data:
@@ -166,3 +420,7 @@ volumes:
 secrets:
   db_password:
     file: ./secrets/db_password.txt
+  admin_password:
+    file: ./secrets/admin_password.txt
+  internal_auth_secret:
+    file: ./secrets/internal_auth_secret.txt

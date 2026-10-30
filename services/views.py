@@ -61,6 +61,19 @@ def load_read_model():
 class Handler(JsonHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/health/detailed":
+            dependencies = {}
+            for name, base in (("telemetry", TELEMETRY_URL), ("incidents", INCIDENTS_URL)):
+                try:
+                    code, body = get_json(base + "/health/detailed")
+                    dependencies[name] = body
+                    if code != 200: dependencies[name]["status"] = "unavailable"
+                except ConnectionError as exc:
+                    dependencies[name] = {"status": "unavailable", "error": str(exc)}
+            healthy = all(item.get("status") == "ok" for item in dependencies.values())
+            self.send_json(200 if healthy else 503, {"service": "views", "status": "ok" if healthy else "degraded",
+                                                     "dependencies": dependencies, "database": "not used by views service"})
+            return
         if parsed.path == "/health":
             states = {}
             for name, base in (("telemetry", TELEMETRY_URL), ("incidents", INCIDENTS_URL)):

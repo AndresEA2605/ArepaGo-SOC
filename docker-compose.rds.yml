@@ -1,4 +1,16 @@
+x-rds-secrets: &rds-secrets
+  - db_password
+  - internal_auth_secret
+  - rds_ca_bundle
+
 services:
+  transaction-router:
+    environment:
+      APP_ENV: production
+      AUTH_COOKIE_SECURE: "true"
+    secrets:
+      - internal_auth_secret
+
   telemetry-service:
     environment:
       DB_SSLMODE: verify-full
@@ -11,9 +23,46 @@ services:
     environment:
       DB_SSLMODE: verify-full
       DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
+
+  auth-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
     secrets:
       - db_password
+      - admin_password
       - rds_ca_bundle
+
+  reports-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
+
+  pedidos-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
+
+  pagos-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
+
+  calificaciones-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
+
+  catalogo-service:
+    environment:
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: /run/secrets/rds_ca_bundle
+    secrets: *rds-secrets
 
 secrets:
   rds_ca_bundle:

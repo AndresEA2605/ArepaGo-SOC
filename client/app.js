@@ -769,6 +769,20 @@ async function checkout() {
     button.disabled = customerCart.size === 0;
   }
 }
+const paymentStatusLabels = {pending: 'Pendiente', paid: 'Pagado', cancelled: 'Cancelado', failed: 'Fallido'};
+const paymentStatusLabel = status => paymentStatusLabels[status] || status || 'Sin registro';
+function orderPaymentLabel(payment, orderStatus) {
+  if (!payment) return 'Sin registro';
+  if (payment.status !== 'pending') return paymentStatusLabel(payment.status);
+  if (orderStatus === 'cancelled') return 'Pedido cancelado';
+  return orderStatus === 'delivered' ? 'Pendiente · confirma en Pagos' : 'Pendiente · se confirma al entregar';
+}
+function customerPaymentLabel(payment, orderStatus) {
+  if (!payment) return 'sin registro';
+  if (payment.status !== 'pending') return paymentStatusLabel(payment.status);
+  if (orderStatus === 'cancelled') return 'pedido cancelado';
+  return orderStatus === 'delivered' ? 'pendiente por confirmar' : 'pendiente al recibir';
+}
 function renderOrders(orders, payments, ratings) {
   const target = byId('customer-orders');
   target.replaceChildren();
@@ -783,7 +797,7 @@ function renderOrders(orders, payments, ratings) {
     card.append(head);
     const payment = paymentByOrder.get(order.id);
     const meta = node('div', 'order-meta');
-    meta.append(node('span', '', `Total ${money(order.total)}`), node('span', '', `ETA ${prettyTime(order.eta)}`), node('span', '', `Entrega: ${order.delivery_address}`), node('span', '', `Pago: ${payment?.status === 'pending' ? 'pendiente al recibir' : payment?.status || 'sin registro'}`));
+    meta.append(node('span', '', `Total ${money(order.total)}`), node('span', '', `ETA ${prettyTime(order.eta)}`), node('span', '', `Entrega: ${order.delivery_address}`), node('span', '', `Pago: ${customerPaymentLabel(payment, order.status)}`));
     card.append(meta);
     const itemList = node('div', 'order-items');
     (order.items || []).forEach(item => itemList.append(node('div', 'order-item-row', `${item.quantity} × ${item.name} · ${money(Number(item.unit_price) * item.quantity)}`)));
@@ -811,7 +825,7 @@ function renderPayments(payments) {
   if (!payments.length) { target.append(node('div', 'empty-state', 'Aún no hay pagos asociados a tus pedidos.')); return; }
   payments.forEach(payment => {
     const row = node('div', 'customer-payment');
-    row.append(node('span', '', `Pedido ${payment.order_id.slice(0, 8)} · efectivo contra entrega`), node('b', '', `${payment.status === 'pending' ? 'Pendiente' : payment.status} · ${money(payment.amount)}`));
+    row.append(node('span', '', `Pedido ${payment.order_id.slice(0, 8)} · efectivo contra entrega`), node('b', '', `${paymentStatusLabel(payment.status)} · ${money(payment.amount)}`));
     target.append(row);
   });
 }
@@ -869,9 +883,10 @@ function renderAdminProducts(products) {
     actions.append(edit, toggle); body.append(actions); card.append(body); target.append(card);
   });
 }
-function renderAdminOrders(orders) {
+function renderAdminOrders(orders, payments = []) {
   const target = byId('admin-orders'); target.replaceChildren();
   if (!orders.length) { target.append(node('div', 'empty-state', 'No hay pedidos registrados.')); return; }
+  const paymentByOrder = new Map(payments.map(payment => [payment.order_id, payment]));
   const labels = {placed:'Recibido',confirmed:'Confirmado',preparing:'En preparación',out_for_delivery:'En camino',delivered:'Entregado',cancelled:'Cancelado'};
   const transitions = {placed:['confirmed','cancelled'],confirmed:['preparing','cancelled'],preparing:['out_for_delivery','cancelled'],out_for_delivery:['delivered']};
   orders.forEach(order => {
@@ -886,7 +901,7 @@ function renderAdminOrders(orders) {
       statuses.forEach(status => { const option = document.createElement('option'); option.value = status; option.textContent = labels[status]; select.append(option); });
       head.append(select);
     }
-    card.append(head, node('p','admin-record-meta',`Cliente ${order.customer_id || '—'} · ETA ${prettyTime(order.eta)}`));
+    card.append(head, node('p','admin-record-meta',`Cliente ${order.customer_id || '—'} · ETA ${prettyTime(order.eta)}`), node('p','admin-record-meta',`Pago: ${orderPaymentLabel(paymentByOrder.get(order.id), order.status)}`));
     (order.items || []).forEach(item => card.append(node('div','order-item-row',`${item.quantity} × ${item.name} · ${money(Number(item.unit_price)*item.quantity)}`)));
     target.append(card);
   });
@@ -897,7 +912,7 @@ function renderAdminPayments(payments, orders) {
   if (!payments.length) { const row = document.createElement('tr'); row.append(node('td','','No hay pagos registrados')); target.append(row); return; }
   payments.forEach(payment => {
     const row = document.createElement('tr');
-    row.append(node('td','',payment.order_id.slice(0,8)),node('td','','Efectivo contra entrega'),node('td','',payment.status === 'pending' ? 'Pendiente' : payment.status),node('td','',money(payment.amount)),node('td','',prettyTime(payment.created_at)));
+    row.append(node('td','',payment.order_id.slice(0,8)),node('td','','Efectivo contra entrega'),node('td','',paymentStatusLabel(payment.status)),node('td','',money(payment.amount)),node('td','',prettyTime(payment.created_at)));
     const action = document.createElement('td');
     if (payment.status === 'pending' && delivered.has(payment.order_id)) { const button = node('button','small-action','Confirmar efectivo recibido'); button.type = 'button'; button.dataset.confirmPayment = payment.id; action.append(button); }
     else action.textContent = payment.status === 'pending' ? 'Disponible tras la entrega' : (payment.paid_at ? `Confirmado ${prettyTime(payment.paid_at)}` : '—');
@@ -1118,7 +1133,13 @@ async function loadAdminView(view) {
   if (!['orders','payments','catalog','ratings','reports'].includes(view)) return;
   byId('global-error').hidden = true;
   try {
-    if (view === 'orders') renderAdminOrders((await api('/api/pedidos/orders')).orders || []);
+    if (view === 'orders') {
+      const orders = (await api('/api/pedidos/orders')).orders || [];
+      let payments = [];
+      try { payments = (await api('/api/pagos/payments')).payments || []; }
+      catch (_) { /* Pedidos sigue disponible aunque Pagos falle. */ }
+      renderAdminOrders(orders, payments);
+    }
     if (view === 'payments') {
       const [payments, orders] = await Promise.all([api('/api/pagos/payments'),api('/api/pedidos/orders')]);
       renderAdminPayments(payments.payments || [],orders.orders || []);

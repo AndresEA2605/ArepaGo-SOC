@@ -59,6 +59,12 @@ class IncidentSimulationTests(unittest.TestCase):
         self.assertEqual(scenario["connection_pools"]["pedidos"]["configured"], 20)
         self.assertEqual(scenario["modules"]["pedidos"]["failure_rate_percent"], 64)
         self.assertEqual(scenario["modules"]["pagos"]["failure_rate_percent"], 59)
+        self.assertEqual(scenario["economic_impact_cop"], 5_182_760_000.0)
+        self.assertEqual(scenario["affected_customers"], 103_800)
+        self.assertEqual(scenario["social_media_mentions"], 34_200)
+        self.assertEqual(scenario["peak_window"]["sample_requests"], 600)
+        self.assertEqual(scenario["peak_window"]["pedidos_failed"], 384)
+        self.assertEqual(scenario["peak_window"]["pagos_failed"], 354)
 
     def test_all_three_mitigations_are_separate_qualitative_comparisons(self):
         result = simulate_mitigations({"mitigations": ["reschedule", "index", "read_replica"]})

@@ -235,6 +235,17 @@ Por eso el umbral es **p95 ≥ 1.000 ms**: no reacciona a un pico aislado, sino 
 
 Una muestra degradada reinicia el conteo; por eso se requieren muestras **consecutivas** con tráfico real.
 
+### Escenario de referencia (27 de septiembre de 2026)
+
+La vista de diagnóstico (`/api/incidents/simulator/reference`) documenta los parámetros de referencia de la afectación operativa:
+
+- **Ventana temporal:** 08:03 a 08:22 (19 minutos).
+- **Pico crítico (08:12–08:14):** 600 solicitudes concurrentes con 64 % de error en Pedidos (384 fallos) y 59 % en Pagos (354 fallos), pools al límite en 20/20 conexiones saturadas.
+- **Servicios no afectados:** Catálogo y Calificaciones operando con latencia < 60 ms y 0 % de fallos al no consultar tablas transaccionales bloqueadas.
+- **Impacto consolidado:** 103.800 transacciones afectadas, $5.182.760.000 COP brutos ($1.913.060.000 COP pérdida directa estimada) y 34.200 menciones.
+- **Causa raíz:** Consulta de reporte diario de ventas con `Sequential Scan` sobre 14,2 millones de registros en `orders` sin índice cubriente en `created_at`.
+- **Mitigaciones operativas:** Reprogramación del reporte a las 06:00 a. m. (cumplida), creación de índices en `created_at` (cumplida) y aislamiento analítico en réplica de lectura RDS (3 de noviembre).
+
 ### Qué detecta y qué no
 
 - **Detecta:** degradación del tráfico que atraviesa el gateway (latencia, 5xx —errores del servidor—, pool de la réplica más saturada) y la conserva como incidente auditable.
@@ -468,6 +479,7 @@ Scripts auxiliares (**solo local**):
 - `python3 scripts/test_incident_detection.py` — induce una caída real de Pedidos y verifica detección y recuperación; `--verify-only` solo consulta.
 - `python3 scripts/smoke_test_customer_flow.py` — prueba de humo (recorrido básico de compra) con datos QA (*Quality Assurance*: pruebas de calidad).
 - `python3 scripts/seed_demo_catalog.py` — catálogo demo inactivo para pruebas.
+- `python3 scripts/seed_incident_telemetry.py` — inyecta la serie cronológica de telemetría histórica del 27-09-2026 (07:55 a 08:22) para verificar gráficas de latencia, saturación de pools y resolución automática en el panel SOC.
 
 ## Pool y capacidad
 

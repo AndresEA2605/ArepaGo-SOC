@@ -1030,10 +1030,13 @@ async function loadSimulatorScenario() {
     target.replaceChildren();
     const summary = node('div','simulator-summary-grid');
     [
-      ['Ventana',`${scenario.time_window.start}–${scenario.time_window.end} · ${scenario.time_window.duration_minutes} min`],
-      ['Reporte',`${Number(scenario.report.orders_examined).toLocaleString('es-CO')} pedidos`],
-      ['Plan observado',scenario.report.query_plan],
-      ['Pools saturados',`Pedidos ${scenario.connection_pools.pedidos.configured}/${scenario.connection_pools.pedidos.configured} · Pagos ${scenario.connection_pools.pagos.configured}/${scenario.connection_pools.pagos.configured}`],
+      ['Ventana', ${scenario.time_window.start} -  ( min)],
+      ['Pico crítico', scenario.peak_window ? ${scenario.peak_window.start} -  (Pedidos 64% / Pagos 59%) : '08:12 - 08:14'],
+      ['Clientes afectados', scenario.affected_customers ? Number(scenario.affected_customers).toLocaleString('es-CO') : '103.800'],
+      ['Impacto económico', scenario.economic_impact_cop ? $ COP : '.182.760.000 COP'],
+      ['Reporte analizado', ${Number(scenario.report.orders_examined).toLocaleString('es-CO')} pedidos],
+      ['Plan observado', scenario.report.query_plan],
+      ['Pools saturados', Pedidos / | Pagos /],
     ].forEach(([label,value])=>{const card=node('div','simulator-stat');card.append(node('span','',label),node('b','',value));summary.append(card);});
     target.append(summary);
     target.append(node('div','simulation-notice',`${scenario.cause_summary} Operaciones: ${scenario.failed_operations}`));
